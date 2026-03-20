@@ -205,3 +205,6 @@ cython_debug/
 marimo/_static/
 marimo/_lsp/
 __marimo__/
+
+# SENTINEL-X generated output files
+sentinel_x_training_curve.png
