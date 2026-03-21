@@ -611,3 +611,198 @@ class TestTFLiteExport:
                 agent, os.path.join(tmp, "i8.tflite"), n_calib_samples=16
             )
         assert len(i8) <= len(dyn)
+
+
+# ===========================================================================
+# 13. LTLConstraintChecker
+# ===========================================================================
+
+_COMM_IDX = sx.LTLConstraintChecker._COMM_IDX   # index of comm_quality_norm
+
+class TestLTLConstraintChecker:
+    def test_default_constraints_registered(self):
+        ltl = sx.LTLConstraintChecker()
+        names = ltl.active_names()
+        assert "no_inaction_on_fault" in names
+        assert "no_full_reset_low_power" in names
+        assert "no_simultaneous_faults" in names
+        assert "comm_link_recovery" in names
+
+    def test_no_inaction_on_fault_violated(self):
+        ltl = sx.LTLConstraintChecker(penalty=-1.0)
+        state = np.zeros(11, dtype=np.float32)
+        state[sx.Spacecraft.HEALTH_FLAG_IDX] = 1.0
+        pen = ltl.evaluate(state, action=0)
+        assert pen < 0.0
+
+    def test_no_inaction_on_fault_not_triggered_by_recovery(self):
+        ltl = sx.LTLConstraintChecker(penalty=-1.0)
+        # Only health flag set; no simultaneous faults, good comm
+        state = np.zeros(11, dtype=np.float32)
+        state[sx.Spacecraft.HEALTH_FLAG_IDX] = 1.0
+        state[sx.SafetyMonitor.POWER_LEVEL_IDX] = 0.9
+        state[_COMM_IDX] = 1.0   # good comm quality
+        pen = ltl.evaluate(state, action=3)
+        # Only no_inaction_on_fault might be relevant; action=3 doesn't trigger it
+        assert pen == pytest.approx(0.0)
+
+    def test_no_full_reset_low_power_violated(self):
+        ltl = sx.LTLConstraintChecker(penalty=-1.0)
+        state = np.zeros(11, dtype=np.float32)
+        state[sx.SafetyMonitor.POWER_LEVEL_IDX] = 0.05
+        state[_COMM_IDX] = 1.0   # good comm quality
+        pen = ltl.evaluate(state, action=2)
+        assert pen < 0.0
+
+    def test_no_violation_returns_zero(self):
+        ltl = sx.LTLConstraintChecker(penalty=-1.0)
+        state = np.zeros(11, dtype=np.float32)
+        state[sx.SafetyMonitor.POWER_LEVEL_IDX] = 0.9
+        state[sx.Spacecraft.HEALTH_FLAG_IDX] = 0.0
+        state[_COMM_IDX] = 1.0   # good comm quality
+        pen = ltl.evaluate(state, action=1)
+        assert pen == pytest.approx(0.0)
+
+    def test_add_custom_constraint(self):
+        ltl = sx.LTLConstraintChecker(penalty=-2.0)
+        ltl.add_constraint("always_fail", lambda s, a: True)
+        assert "always_fail" in ltl.active_names()
+        state = np.zeros(11, dtype=np.float32)
+        state[_COMM_IDX] = 1.0  # good comm to avoid other violations
+        pen = ltl.evaluate(state, action=1)
+        # "always_fail" fires → penalty is at least -2.0
+        assert pen <= -2.0
+
+    def test_remove_constraint(self):
+        ltl = sx.LTLConstraintChecker(penalty=-1.0)
+        ltl.remove_constraint("no_inaction_on_fault")
+        assert "no_inaction_on_fault" not in ltl.active_names()
+
+    def test_remove_nonexistent_is_noop(self):
+        ltl = sx.LTLConstraintChecker()
+        ltl.remove_constraint("nonexistent")   # should not raise
+
+    def test_penalty_must_not_be_positive(self):
+        with pytest.raises(ValueError):
+            sx.LTLConstraintChecker(penalty=1.0)
+
+    def test_zero_penalty_allowed(self):
+        ltl = sx.LTLConstraintChecker(penalty=0.0)
+        state = np.zeros(11, dtype=np.float32)
+        state[sx.Spacecraft.HEALTH_FLAG_IDX] = 1.0
+        assert ltl.evaluate(state, action=0) == pytest.approx(0.0)
+
+
+# ===========================================================================
+# 14. extract_decision_tree
+# ===========================================================================
+
+class TestExtractDecisionTree:
+    def test_returns_classifier(self):
+        pytest.importorskip("sklearn")
+        agent = make_agent()
+        dt = sx.extract_decision_tree(agent, n_samples=200, max_depth=4)
+        assert dt is not None
+
+    def test_fidelity_in_output(self, capsys):
+        pytest.importorskip("sklearn")
+        agent = make_agent()
+        sx.extract_decision_tree(agent, n_samples=100, max_depth=4)
+        out = capsys.readouterr().out
+        assert "fidelity=" in out
+
+    def test_predict_returns_valid_action(self):
+        pytest.importorskip("sklearn")
+        agent = make_agent()
+        dt = sx.extract_decision_tree(agent, n_samples=100, max_depth=3)
+        state = np.random.rand(1, agent.state_dim).astype(np.float32)
+        action = int(dt.predict(state)[0])
+        assert 0 <= action < agent.action_dim
+
+    def test_depth_respected(self):
+        pytest.importorskip("sklearn")
+        agent = make_agent()
+        dt = sx.extract_decision_tree(agent, n_samples=200, max_depth=5)
+        assert dt.get_depth() <= 5
+
+    def test_raises_without_sklearn(self, monkeypatch):
+        monkeypatch.setattr(sx, "_SKLEARN_AVAILABLE", False)
+        agent = make_agent()
+        with pytest.raises(ImportError):
+            sx.extract_decision_tree(agent)
+
+
+# ===========================================================================
+# 15. MissionScenario and build_swarm_for_scenario
+# ===========================================================================
+
+class TestMissionScenario:
+    @pytest.mark.parametrize("factory", [
+        sx.MissionScenario.lunar_gateway,
+        sx.MissionScenario.mars_orbiter,
+        sx.MissionScenario.cubesat_swarm,
+    ])
+    def test_preset_creates_scenario(self, factory):
+        scenario = factory()
+        assert isinstance(scenario, sx.MissionScenario)
+        assert scenario.name
+        assert scenario.profile in (
+            sx.MissionProfile.BALANCED,
+            sx.MissionProfile.MAXIMIZE_DATA_RETURN,
+            sx.MissionProfile.EXTEND_LIFESPAN,
+            sx.MissionProfile.POWER_CONSTRAINED,
+        )
+
+    def test_custom_scenario(self):
+        s = sx.MissionScenario(
+            name="Test",
+            profile=sx.MissionProfile.BALANCED,
+            num_spacecraft=2,
+            comm_delay_steps=3,
+            link_dropout_prob=0.1,
+        )
+        assert s.num_spacecraft == 2
+        assert s.comm_delay_steps == 3
+
+    def test_summary_returns_string(self):
+        s = sx.MissionScenario.lunar_gateway()
+        summary = s.summary()
+        assert isinstance(summary, str)
+        assert "Lunar Gateway" in summary
+        assert "Profile" in summary
+
+    def test_build_swarm_returns_federated_swarm(self):
+        s = sx.MissionScenario.lunar_gateway()
+        s.num_spacecraft = 2
+        swarm = sx.build_swarm_for_scenario(s)
+        assert isinstance(swarm, sx.FederatedSwarm)
+        assert len(swarm.spacecraft) == 2
+
+    def test_build_swarm_fault_params_applied(self):
+        s = sx.MissionScenario.mars_orbiter()
+        s.num_spacecraft = 2
+        swarm = sx.build_swarm_for_scenario(s)
+        for sc in swarm.spacecraft:
+            assert sc.memory.flip_rate == pytest.approx(s.flip_rate_per_bit)
+            assert sc.sensor.stuck_prob == pytest.approx(s.sensor_stuck_prob)
+            assert sc.thermal.drift_std == pytest.approx(s.thermal_drift_std)
+            assert sc.power.drain_rate == pytest.approx(s.power_drain_rate)
+
+    def test_build_swarm_train_episode(self):
+        s = sx.MissionScenario.cubesat_swarm()
+        s.num_spacecraft = 2
+        swarm = sx.build_swarm_for_scenario(s, safety_monitor=sx.SafetyMonitor())
+        r = swarm.train_episode(max_steps=20)
+        assert isinstance(r, float)
+
+    def test_mars_orbiter_has_delay(self):
+        s = sx.MissionScenario.mars_orbiter()
+        assert s.comm_delay_steps > 0
+
+    def test_cubesat_has_large_swarm(self):
+        s = sx.MissionScenario.cubesat_swarm()
+        assert s.num_spacecraft >= 4
+
+    def test_lunar_gateway_power_constrained(self):
+        s = sx.MissionScenario.lunar_gateway()
+        assert s.profile == sx.MissionProfile.POWER_CONSTRAINED

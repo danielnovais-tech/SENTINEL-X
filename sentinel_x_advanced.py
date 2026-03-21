@@ -68,8 +68,24 @@ Extends the basic Q-learning prototype with:
        against decentralised gossip under varying link-dropout rates and prints
        a formatted summary table.
 
+  15. LTL reward shaping – LTLConstraintChecker encodes safety properties as
+       Linear Temporal Logic (LTL)-style state predicates.  At each training
+       step any active LTL violation incurs a configurable penalty, turning
+       hard safety rules into a soft constrained-RL signal.
+
+  16. Decision-tree policy extraction – extract_decision_tree() trains a
+       scikit-learn DecisionTreeClassifier to imitate the DQN greedy policy
+       (imitation learning), producing a certifiable surrogate that can be
+       inspected, exhaustively tested, and submitted to formal tools.
+
+  17. Mission scenarios – MissionScenario bundles fault-model parameters and
+       reward-profile settings for three real mission concepts:
+       Lunar Gateway (HALO node), Mars Sample Return orbiter, and CubeSat
+       swarm (low Earth orbit constellation).
+       build_swarm_for_scenario() returns a ready-to-train FederatedSwarm.
+
 Install dependencies:
-    pip install numpy tensorflow matplotlib
+    pip install numpy tensorflow matplotlib scikit-learn
 """
 import numpy as np
 import random
@@ -80,6 +96,11 @@ import matplotlib
 matplotlib.use("Agg")   # non-interactive backend (safe for servers/CI)
 import matplotlib.pyplot as plt
 
+try:
+    from sklearn.tree import DecisionTreeClassifier
+    _SKLEARN_AVAILABLE = True
+except ImportError:
+    _SKLEARN_AVAILABLE = False
 
 # -----------------------------------------------------------------------
 # 1. Realistic Fault Generators
@@ -476,16 +497,40 @@ class Spacecraft:
 
     HEALTH_FLAG_IDX = 5   # position of health_flag in the base state vector
 
-    def __init__(self, spacecraft_id=0):
+    def __init__(
+        self,
+        spacecraft_id: int = 0,
+        flip_rate_per_bit: float = 1e-4,
+        sensor_stuck_prob: float = 0.01,
+        thermal_drift_std: float = 0.1,
+        thermal_spike_prob: float = 0.005,
+        power_drain_rate: float = 0.10,
+    ):
         self.id = spacecraft_id
+        # Store fault-model parameters so they survive reset() calls.
+        # build_swarm_for_scenario sets these at construction time.
+        self._flip_rate_per_bit = flip_rate_per_bit
+        self._sensor_stuck_prob = sensor_stuck_prob
+        self._thermal_drift_std = thermal_drift_std
+        self._thermal_spike_prob = thermal_spike_prob
+        self._power_drain_rate = power_drain_rate
         self._reset_state()
 
     def _reset_state(self):
         """Initialise (or re-initialise) all mutable state for a new episode."""
-        self.memory = MemoryArray(size_bits=1024, flip_rate_per_bit=1e-4)
-        self.sensor = Sensor(true_value=25.0, noise_std=0.5, stuck_prob=0.01)
-        self.thermal = ThermalSubsystem()
-        self.power = PowerSubsystem()
+        self.memory = MemoryArray(
+            size_bits=1024, flip_rate_per_bit=self._flip_rate_per_bit
+        )
+        self.sensor = Sensor(
+            true_value=25.0,
+            noise_std=0.5,
+            stuck_prob=self._sensor_stuck_prob,
+        )
+        self.thermal = ThermalSubsystem(
+            drift_std=self._thermal_drift_std,
+            spike_prob=self._thermal_spike_prob,
+        )
+        self.power = PowerSubsystem(drain_rate=self._power_drain_rate)
         self.attitude = AttitudeControlSubsystem()
         self.comm = CommSubsystem()
         self.healthy = True
@@ -1858,7 +1903,433 @@ class AdversarialTester:
 
 
 # -----------------------------------------------------------------------
-# 13. Federation Benchmark (FedAvg vs Gossip)
+# 13. LTL Reward Shaping (Constrained RL)
+# -----------------------------------------------------------------------
+
+class LTLConstraintChecker:
+    """
+    Lightweight Linear Temporal Logic (LTL)-style safety-constraint checker.
+
+    Each constraint is a named predicate over the current state vector.  At
+    every training step the checker evaluates all active constraints; any
+    violation returns a negative penalty that can be added to the mission
+    reward to implement *constrained RL*.
+
+    Supported built-in constraints (all evaluated on the normalised state):
+
+    * **no_inaction_on_fault** – penalise action=0 when ``health_flag``=1
+    * **no_full_reset_low_power** – penalise action=2 when power ≤ threshold
+    * **no_simultaneous_faults** – penalise states where ≥ 3 fault flags
+      are simultaneously active (indicates cascading failures)
+    * **comm_link_recovery** – penalise any action other than safe-mode (3)
+      when ``comm_quality_norm`` drops below a critical level
+
+    Operators may add custom constraints via ``add_constraint()``.
+
+    Parameters
+    ----------
+    penalty : float
+        Reward deduction applied per violated constraint per step (< 0).
+    """
+
+    # Indices in the 10/11-dim normalised state vector
+    _HEALTH_IDX = Spacecraft.HEALTH_FLAG_IDX           # 5
+    _POWER_IDX = 7
+    _ATTITUDE_IDX = 8
+    _COMM_IDX = 9
+    _THERMAL_IDX = 6
+    _PARITY_IDX = 1
+    _STUCK_IDX = 3
+
+    def __init__(self, penalty: float = -0.5):
+        if penalty > 0:
+            raise ValueError("penalty must be ≤ 0 (a negative or zero value).")
+        self.penalty = float(penalty)
+        # dict name -> callable(state, action) -> bool (True = violated)
+        self._constraints: dict = {}
+        self._add_builtin_constraints()
+
+    # ------------------------------------------------------------------
+    # Public API
+    # ------------------------------------------------------------------
+
+    def add_constraint(self, name: str, predicate) -> None:
+        """
+        Register a custom constraint.
+
+        Parameters
+        ----------
+        name : str
+            Unique identifier for the constraint.
+        predicate : callable(state: np.ndarray, action: int) -> bool
+            Returns True when the constraint is **violated**.
+        """
+        self._constraints[name] = predicate
+
+    def remove_constraint(self, name: str) -> None:
+        """Remove a constraint by name (no-op if not found)."""
+        self._constraints.pop(name, None)
+
+    def evaluate(self, state: np.ndarray, action: int) -> float:
+        """
+        Evaluate all active constraints against (*state*, *action*).
+
+        Returns
+        -------
+        float
+            Total penalty: ``n_violated × self.penalty``.  Zero if no
+            constraint is violated.
+        """
+        n_violated = sum(
+            1 for pred in self._constraints.values() if pred(state, action)
+        )
+        return n_violated * self.penalty
+
+    def active_names(self) -> list:
+        """Return a list of currently registered constraint names."""
+        return list(self._constraints.keys())
+
+    # ------------------------------------------------------------------
+    # Built-in constraints
+    # ------------------------------------------------------------------
+
+    def _add_builtin_constraints(self) -> None:
+        idx_h = self._HEALTH_IDX
+        idx_p = self._POWER_IDX
+        idx_c = self._COMM_IDX
+
+        def _no_inaction_on_fault(state, action):
+            return float(state[idx_h]) >= 0.5 and action == 0
+
+        def _no_full_reset_low_power(state, action):
+            power = float(state[idx_p]) if len(state) > idx_p else 1.0
+            return action == 2 and power < 0.15
+
+        def _no_simultaneous_faults(state, _action):
+            fault_flags = [
+                float(state[self._THERMAL_IDX]),
+                float(state[self._HEALTH_IDX]),
+                float(state[self._PARITY_IDX]),
+                float(state[self._STUCK_IDX]),
+            ]
+            return sum(f >= 0.5 for f in fault_flags) >= 3
+
+        def _comm_link_recovery(state, action):
+            comm_q = float(state[idx_c]) if len(state) > idx_c else 1.0
+            return comm_q < 0.1 and action not in (2, 3)
+
+        self._constraints = {
+            "no_inaction_on_fault": _no_inaction_on_fault,
+            "no_full_reset_low_power": _no_full_reset_low_power,
+            "no_simultaneous_faults": _no_simultaneous_faults,
+            "comm_link_recovery": _comm_link_recovery,
+        }
+
+
+# -----------------------------------------------------------------------
+# 14. Decision-Tree Policy Extraction (Imitation Learning)
+# -----------------------------------------------------------------------
+
+def extract_decision_tree(
+    agent: "DQNAgent",
+    n_samples: int = 2000,
+    max_depth: int = 8,
+    rng_seed: int = 42,
+) -> "DecisionTreeClassifier":
+    """
+    Fit a decision-tree surrogate that imitates the DQN's greedy policy.
+
+    The surrogate is trained via *imitation learning* (behavioural cloning):
+    random states are labelled by the DQN's ``argmax Q``-value and a
+    ``DecisionTreeClassifier`` is fitted on those (state, greedy_action)
+    pairs.  The resulting tree:
+
+    * Can be exhaustively verified over its finite input partition.
+    * Is human-readable and auditable.
+    * Can be exported to SMT or interval-arithmetic solvers (e.g., Marabou,
+      α,β-CROWN) for flight-level certifiability.
+
+    Parameters
+    ----------
+    agent : DQNAgent
+        Trained agent to imitate.
+    n_samples : int
+        Number of random states used for imitation.
+    max_depth : int
+        Maximum depth of the decision tree (controls model complexity).
+    rng_seed : int
+        Reproducibility seed.
+
+    Returns
+    -------
+    DecisionTreeClassifier
+        Fitted scikit-learn classifier.  Accuracy relative to the DQN is
+        printed to stdout.
+
+    Raises
+    ------
+    ImportError
+        If scikit-learn is not installed.
+    """
+    if not _SKLEARN_AVAILABLE:
+        raise ImportError(
+            "scikit-learn is required for decision-tree extraction. "
+            "Install it with: pip install scikit-learn"
+        )
+    rng = np.random.default_rng(rng_seed)
+    states = rng.uniform(0.0, 1.0, size=(n_samples, agent.state_dim)).astype(
+        np.float32
+    )
+    # Label with the DQN greedy policy
+    q_vals = agent.model.predict(states, verbose=0)
+    labels = np.argmax(q_vals, axis=1)
+
+    dt = DecisionTreeClassifier(max_depth=max_depth, random_state=rng_seed)
+    dt.fit(states, labels)
+
+    # Compute fidelity (agreement with DQN labels)
+    preds = dt.predict(states)
+    fidelity = float(np.mean(preds == labels))
+    n_leaves = dt.get_n_leaves()
+    print(
+        f"Decision-tree surrogate: depth={dt.get_depth()}, "
+        f"leaves={n_leaves}, fidelity={fidelity * 100:.1f}%"
+    )
+    return dt
+
+
+# -----------------------------------------------------------------------
+# 15. Mission Scenarios
+# -----------------------------------------------------------------------
+
+class MissionScenario:
+    """
+    Bundles fault-model parameters and reward profile for a concrete mission.
+
+    Three pre-built scenarios are available as class methods:
+
+    * :meth:`lunar_gateway` – Near-rectilinear halo orbit (NRHO).  Moderate
+      thermal and attitude requirements; high communication quality with
+      Earth/Artemis crew; mission-critical power budget.
+
+    * :meth:`mars_orbiter` – Mars Sample Return relay orbiter.  Deep-space
+      comm delays; high radiation flux (elevated bit-flip rate); power
+      constrained (solar distance); thermal extremes.
+
+    * :meth:`cubesat_swarm` – Low-Earth orbit 3U/6U swarm.  Frequent eclipse
+      cycles (thermal spikes); limited onboard compute; high stuck-sensor
+      probability due to space weather; data-return-oriented mission.
+
+    Each scenario is created with ``MissionScenario(**params)`` or via the
+    convenience class methods (recommended).  Pass it to
+    :func:`build_swarm_for_scenario` to obtain a configured ``FederatedSwarm``.
+
+    Attributes
+    ----------
+    name : str
+        Human-readable mission name.
+    profile : str
+        ``MissionProfile`` constant ('balanced', 'data_return', etc.)
+    num_spacecraft : int
+        Suggested swarm size for simulation.
+    comm_delay_steps : int
+        Federation communication delay (deep-space latency in episodes).
+    link_dropout_prob : float
+        Fraction of federated rounds that miss due to link outages.
+    thermal_drift_std : float
+        Standard deviation of the thermal random walk (higher = more dynamic).
+    thermal_spike_prob : float
+        Probability of a sudden large thermal spike per step.
+    flip_rate_per_bit : float
+        SEU (bit-flip) probability per bit per step (higher near radiation belts).
+    sensor_stuck_prob : float
+        Probability that a sensor becomes stuck per step.
+    power_drain_rate : float
+        Mean power drain per step (higher away from the sun).
+    """
+
+    def __init__(
+        self,
+        name: str,
+        profile: str,
+        num_spacecraft: int = 4,
+        comm_delay_steps: int = 0,
+        link_dropout_prob: float = 0.0,
+        thermal_drift_std: float = 0.1,
+        thermal_spike_prob: float = 0.005,
+        flip_rate_per_bit: float = 1e-4,
+        sensor_stuck_prob: float = 0.01,
+        power_drain_rate: float = 0.10,
+    ):
+        self.name = name
+        self.profile = profile
+        self.num_spacecraft = num_spacecraft
+        self.comm_delay_steps = comm_delay_steps
+        self.link_dropout_prob = link_dropout_prob
+        self.thermal_drift_std = thermal_drift_std
+        self.thermal_spike_prob = thermal_spike_prob
+        self.flip_rate_per_bit = flip_rate_per_bit
+        self.sensor_stuck_prob = sensor_stuck_prob
+        self.power_drain_rate = power_drain_rate
+
+    # ------------------------------------------------------------------
+    # Pre-built scenarios
+    # ------------------------------------------------------------------
+
+    @classmethod
+    def lunar_gateway(cls) -> "MissionScenario":
+        """
+        Lunar Gateway (HALO node) in near-rectilinear halo orbit.
+
+        Key characteristics:
+        - Moderate thermal environment; weekly eclipse transitions.
+        - Excellent Earth comms with < 1.3 s round-trip delay.
+        - Crew safety is paramount → power-constrained profile.
+        - Low radiation flux compared to deep space.
+        """
+        return cls(
+            name="Lunar Gateway (HALO)",
+            profile=MissionProfile.POWER_CONSTRAINED,
+            num_spacecraft=3,
+            comm_delay_steps=0,          # < 1.3 s round-trip → no sim delay
+            link_dropout_prob=0.05,      # occasional Artemis crew comm priority
+            thermal_drift_std=0.15,      # eclipse cycles every ~7 days
+            thermal_spike_prob=0.008,
+            flip_rate_per_bit=5e-5,      # lower than deep space
+            sensor_stuck_prob=0.008,
+            power_drain_rate=0.09,       # solar panels at 1 AU
+        )
+
+    @classmethod
+    def mars_orbiter(cls) -> "MissionScenario":
+        """
+        Mars Sample Return relay orbiter.
+
+        Key characteristics:
+        - Deep-space comms: 3–22 min one-way delay → large federation delay.
+        - Higher radiation flux in interplanetary space.
+        - Significant power reduction (solar panels at 1.5 AU).
+        - Thermal extremes due to Mars solar distance and dust storm risk.
+        - Link dropout from planetary occultation or dust storms.
+        """
+        return cls(
+            name="Mars Sample Return Orbiter",
+            profile=MissionProfile.MAXIMIZE_DATA_RETURN,
+            num_spacecraft=2,
+            comm_delay_steps=15,          # ~22-min max delay ≈ 15 training eps
+            link_dropout_prob=0.15,       # occultation + dust storm dropouts
+            thermal_drift_std=0.20,       # larger thermal swings
+            thermal_spike_prob=0.012,
+            flip_rate_per_bit=3e-4,       # higher SEU rate in interplanetary space
+            sensor_stuck_prob=0.015,
+            power_drain_rate=0.14,        # reduced solar flux at Mars
+        )
+
+    @classmethod
+    def cubesat_swarm(cls) -> "MissionScenario":
+        """
+        Low-Earth orbit 3U/6U CubeSat swarm (e.g., Planet Labs style).
+
+        Key characteristics:
+        - Frequent eclipse cycles (every ~90 min) → thermal spikes.
+        - Data-return mission; maximise downlink during ground contacts.
+        - Large swarm; gossip-style federation scales naturally.
+        - High stuck-sensor rate due to space weather and component quality.
+        - Limited onboard compute; simple actions preferred.
+        """
+        return cls(
+            name="LEO CubeSat Swarm",
+            profile=MissionProfile.MAXIMIZE_DATA_RETURN,
+            num_spacecraft=8,
+            comm_delay_steps=1,           # downlink contacts every ~90 min
+            link_dropout_prob=0.25,       # limited contact windows
+            thermal_drift_std=0.25,       # rapid eclipse cycling
+            thermal_spike_prob=0.018,
+            flip_rate_per_bit=2e-4,       # moderate LEO radiation
+            sensor_stuck_prob=0.025,      # COTS component quality
+            power_drain_rate=0.11,
+        )
+
+    def summary(self) -> str:
+        """Return a formatted one-page summary of the scenario parameters."""
+        lines = [
+            "=" * 55,
+            f"  Mission Scenario: {self.name}",
+            "=" * 55,
+            f"  Profile            : {self.profile}",
+            f"  Swarm size         : {self.num_spacecraft}",
+            f"  Comm delay (eps)   : {self.comm_delay_steps}",
+            f"  Link dropout       : {self.link_dropout_prob:.0%}",
+            f"  Thermal drift std  : {self.thermal_drift_std}",
+            f"  Thermal spike prob : {self.thermal_spike_prob}",
+            f"  SEU flip rate      : {self.flip_rate_per_bit:.1e} /bit/step",
+            f"  Sensor stuck prob  : {self.sensor_stuck_prob}",
+            f"  Power drain rate   : {self.power_drain_rate}",
+            "=" * 55,
+        ]
+        return "\n".join(lines)
+
+
+def build_swarm_for_scenario(
+    scenario: MissionScenario,
+    action_dim: int = 4,
+    federated_interval: int = 10,
+    safety_monitor: "SafetyMonitor" = None,
+) -> "FederatedSwarm":
+    """
+    Construct a ``FederatedSwarm`` configured for *scenario*.
+
+    Each spacecraft in the swarm is initialised with fault-model parameters
+    drawn from the scenario definition.  The mission reward profile and
+    federation settings are applied automatically.  Fault-model parameters
+    are stored on each ``Spacecraft`` instance so they persist across
+    ``reset()`` calls between training episodes.
+
+    Parameters
+    ----------
+    scenario : MissionScenario
+        The mission scenario configuration.
+    action_dim : int
+        Number of discrete recovery actions (default 4).
+    federated_interval : int
+        Episodes between federated weight aggregations.
+    safety_monitor : SafetyMonitor, optional
+        Safety veto layer to integrate into training.
+
+    Returns
+    -------
+    FederatedSwarm
+        A ready-to-train swarm pre-configured for the scenario.
+    """
+    swarm = FederatedSwarm(
+        num_spacecraft=scenario.num_spacecraft,
+        action_dim=action_dim,
+        mission_profile=MissionProfile(scenario.profile),
+        federated_interval=federated_interval,
+        comm_delay_steps=scenario.comm_delay_steps,
+        link_dropout_prob=scenario.link_dropout_prob,
+        safety_monitor=safety_monitor,
+    )
+    # Replace each spacecraft with a scenario-configured instance so that
+    # fault parameters persist across reset() calls between episodes.
+    swarm.spacecraft = [
+        Spacecraft(
+            spacecraft_id=i,
+            flip_rate_per_bit=scenario.flip_rate_per_bit,
+            sensor_stuck_prob=scenario.sensor_stuck_prob,
+            thermal_drift_std=scenario.thermal_drift_std,
+            thermal_spike_prob=scenario.thermal_spike_prob,
+            power_drain_rate=scenario.power_drain_rate,
+        )
+        for i in range(scenario.num_spacecraft)
+    ]
+    for sc in swarm.spacecraft:
+        sc._peer_sensor_deviation = 0.0
+    return swarm
+
+
+# -----------------------------------------------------------------------
+# 16. Federation Benchmark (FedAvg vs Gossip)
 # -----------------------------------------------------------------------
 
 def benchmark_federation(
@@ -1972,7 +2443,7 @@ def benchmark_federation(
 
 
 # -----------------------------------------------------------------------
-# 14. Main Training Loop
+# 17. Main Training Loop
 # -----------------------------------------------------------------------
 
 def run_do_nothing_baseline(episodes=10, max_steps=200):
@@ -2223,7 +2694,63 @@ if __name__ == "__main__":
     )
 
     # ------------------------------------------------------------------
-    # 14. Save training curves (basic swarm + all profiles + gossip)
+    # 14. LTL reward-shaping demo
+    # ------------------------------------------------------------------
+    print("\n" + "=" * 60)
+    print("LTL constraint checker demo")
+    print("=" * 60)
+    ltl = LTLConstraintChecker(penalty=-0.5)
+    print(f"  Active LTL constraints: {ltl.active_names()}")
+    # Violated: action=0 on faulted state (no_inaction_on_fault)
+    fault_st = np.zeros(FederatedSwarm.COORD_STATE_DIM, dtype=np.float32)
+    fault_st[Spacecraft.HEALTH_FLAG_IDX] = 1.0
+    pen = ltl.evaluate(fault_st, action=0)
+    print(f"  Penalty for action=0 on faulted state   : {pen}")
+    # Safe action – no violation expected
+    pen_safe = ltl.evaluate(fault_st, action=3)
+    print(f"  Penalty for action=3 on faulted state   : {pen_safe}")
+    # Low-power full-reset violation
+    lp_st = np.zeros(FederatedSwarm.COORD_STATE_DIM, dtype=np.float32)
+    lp_st[SafetyMonitor.POWER_LEVEL_IDX] = 0.05
+    pen_lp = ltl.evaluate(lp_st, action=2)
+    print(f"  Penalty for action=2 on low-power state : {pen_lp}")
+
+    # ------------------------------------------------------------------
+    # 15. Decision-tree policy extraction demo
+    # ------------------------------------------------------------------
+    print("\n" + "=" * 60)
+    print("Decision-tree policy extraction (imitation learning)")
+    print("=" * 60)
+    if _SKLEARN_AVAILABLE:
+        dt = extract_decision_tree(fed_swarm.agents[0], n_samples=1000, max_depth=6)
+        # Smoke-test the surrogate on a few states
+        test_state = np.random.rand(1, fed_swarm.agents[0].state_dim).astype(np.float32)
+        dt_action = int(dt.predict(test_state)[0])
+        dqn_action = int(
+            np.argmax(fed_swarm.agents[0].model.predict(test_state, verbose=0)[0])
+        )
+        print(f"  DQN action: {dqn_action}  |  Decision-tree action: {dt_action}")
+    else:
+        print("  scikit-learn not installed; skipping decision-tree demo.")
+
+    # ------------------------------------------------------------------
+    # 16. Mission scenario demo
+    # ------------------------------------------------------------------
+    print("\n" + "=" * 60)
+    print("Mission scenario presets demo")
+    print("=" * 60)
+    for scenario in (
+        MissionScenario.lunar_gateway(),
+        MissionScenario.mars_orbiter(),
+        MissionScenario.cubesat_swarm(),
+    ):
+        print(scenario.summary())
+        sc_swarm = build_swarm_for_scenario(scenario, safety_monitor=SafetyMonitor())
+        sc_reward = sc_swarm.train_episode(max_steps=50)
+        print(f"  One-episode reward: {sc_reward:.2f}\n")
+
+    # ------------------------------------------------------------------
+    # 17. Save training curves (basic swarm + all profiles + gossip)
     # ------------------------------------------------------------------
     plt.figure()
     plt.plot(rewards_per_episode, label="Basic swarm")

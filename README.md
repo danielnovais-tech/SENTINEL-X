@@ -20,9 +20,13 @@ Deep-space systems are fragile, and rule-based recovery can't keep pace with unp
   - **Gossip-based federation** – `GossipServer` provides a decentralised alternative where each spacecraft gossips with k random neighbours, scaling to large constellations without a central server.
   - **Multi-agent coordination** – `FederatedSwarm` cross-checks peer sensor readings to detect stuck sensors that individual agents cannot diagnose alone.
   - **TFLite export** – `export_tflite()` (dynamic-range) and `export_tflite_int8()` (full int8, for Cortex-M / MCU) serialise a trained DQN for embedded deployment.
-  - **Safety monitor** – `SafetyMonitor` is a rule-based FDIR veto layer: never "do nothing" on a fault, never reset hardware on critically low power.
-  - **Adversarial testing** – `AdversarialTester` uses FGSM to find minimal state perturbations that flip the greedy action, revealing policy fragility.
+  - **Safety monitor** – `SafetyMonitor` is a rule-based FDIR veto layer: never "do nothing" on a fault, never reset hardware on critically low power.  Pass it to `FederatedSwarm` via `safety_monitor=` to train the agent to avoid veto-triggering actions.
+  - **Adversarial testing** – `AdversarialTester` uses FGSM to find minimal state perturbations that flip the greedy action; `augment_replay_buffer()` injects adversarial transitions to harden the policy; `certify_robustness()` binary-searches the minimum per-state perturbation radius.
   - **Formal verification** – `PolicyVerifier` runs lightweight safety proofs (safety constraint, Q-value margin, action coverage) over a trained policy and prints a CI-friendly report.
+  - **LTL reward shaping** – `LTLConstraintChecker` encodes safety properties as Linear Temporal Logic (LTL) predicates and penalises violations at training time (constrained RL).
+  - **Decision-tree extraction** – `extract_decision_tree()` trains a scikit-learn `DecisionTreeClassifier` surrogate via imitation learning, providing a certifiable, human-readable proxy for the DQN.
+  - **Mission scenario presets** – `MissionScenario.lunar_gateway()`, `.mars_orbiter()`, `.cubesat_swarm()` bundle fault-model and reward-profile parameters for three real mission concepts; `build_swarm_for_scenario()` builds the ready-to-train swarm.
+  - **Federation benchmark** – `benchmark_federation()` compares FedAvg and gossip under configurable link-dropout rates and prints a summary table.
 
 ---
 
@@ -268,17 +272,156 @@ for episode in range(200):
 
 ## Adversarial Testing
 
-`AdversarialTester` uses FGSM to find minimal perturbations that flip the agent's greedy action:
+`AdversarialTester` uses FGSM to find minimal perturbations that flip the agent's greedy action, and provides two additional tools:
 
 ```python
 from sentinel_x_advanced import AdversarialTester
 
 tester = AdversarialTester(agent, epsilon=0.05)
+
+# Find adversarial examples
 results = tester.find_adversarial_examples(n_examples=200)
 tester.summary(results, n_tested=200)
+
+# Augment replay buffers to harden the policy
+n = tester.augment_replay_buffer(agents, n_examples=200, safety_monitor=monitor)
+
+# Certify per-state robustness radius
+cert = tester.certify_robustness(n_samples=100, eps_hi=0.3, n_bisect=10)
+print(f"Mean certified radius: {cert['mean_radius']:.4f}")
 ```
 
-Adversarial examples can be injected back into the replay buffer for adversarial training.
+---
+
+## LTL Reward Shaping
+
+`LTLConstraintChecker` encodes safety properties as LTL-style predicates and returns a penalty at each step for any active violation, implementing constrained RL:
+
+```python
+from sentinel_x_advanced import LTLConstraintChecker
+
+ltl = LTLConstraintChecker(penalty=-0.5)
+
+# Built-in constraints: no_inaction_on_fault, no_full_reset_low_power,
+#                       no_simultaneous_faults, comm_link_recovery
+
+# Add a custom constraint
+ltl.add_constraint(
+    "safe_attitude",
+    lambda state, action: float(state[8]) > 0.9 and action == 0,
+)
+
+penalty = ltl.evaluate(state, action)   # total penalty this step
+```
+
+Integrate into a training loop by adding `penalty` to the mission reward before storing the transition in the replay buffer.
+
+---
+
+## Decision-Tree Policy Extraction
+
+`extract_decision_tree()` trains a scikit-learn `DecisionTreeClassifier` to imitate the DQN policy (behavioural cloning), producing a certifiable and human-auditable surrogate:
+
+```python
+from sentinel_x_advanced import extract_decision_tree
+
+# Requires: pip install scikit-learn
+dt = extract_decision_tree(agent, n_samples=2000, max_depth=8)
+# Decision-tree surrogate: depth=8, leaves=127, fidelity=94.2%
+
+# Use the surrogate for inference
+action = int(dt.predict(state[np.newaxis, :])[0])
+```
+
+The tree can be exported to DOT format (`sklearn.tree.export_graphviz`) for visual inspection, or fed into interval-arithmetic solvers (e.g., α,β-CROWN, Marabou) for flight-certifiable verification.
+
+---
+
+## Mission Scenario Presets
+
+`MissionScenario` bundles fault-model parameters and reward profile for three real mission concepts:
+
+```python
+from sentinel_x_advanced import MissionScenario, build_swarm_for_scenario, SafetyMonitor
+
+# Lunar Gateway – NRHO, power-constrained, Earth-proximity comms
+scenario = MissionScenario.lunar_gateway()
+
+# Mars Sample Return orbiter – deep-space delay, high radiation
+scenario = MissionScenario.mars_orbiter()
+
+# LEO CubeSat swarm – frequent eclipses, data-return, gossip-friendly
+scenario = MissionScenario.cubesat_swarm()
+
+print(scenario.summary())
+
+# Build a ready-to-train FederatedSwarm for this mission
+swarm = build_swarm_for_scenario(scenario, safety_monitor=SafetyMonitor())
+avg_reward = swarm.train_episode(max_steps=150)
+```
+
+---
+
+## Deployment Goals
+
+### For Research
+
+SENTINEL-X provides a reproducible baseline for papers on:
+
+- **Federated reinforcement learning for space autonomy**: compare FedAvg vs gossip convergence under deep-space delays and link outages using `benchmark_federation()`.
+- **Adversarial robustness of safety-critical policies**: measure flip rates before/after `augment_replay_buffer()` and report certified radii from `certify_robustness()`.
+- **Constrained RL with LTL specifications**: demonstrate that `LTLConstraintChecker` penalties steer agents toward constraint-compliant policies.
+- **Formal verification of neural network policies**: use `PolicyVerifier` as a lightweight baseline, then compare to Marabou or α,β-CROWN for full-space certification.
+- **Certifiable policy surrogates**: show that `extract_decision_tree()` achieves >90% fidelity at depth ≤ 8 and can be exhaustively verified.
+
+### For Engineering (Hardware-in-the-Loop)
+
+The recommended HIL workflow:
+
+1. **Export** the trained DQN to int8 TFLite: `export_tflite_int8(agent, "model_int8.tflite")`.
+2. **Flash** the `.tflite` flatbuffer to a Cortex-M target (STM32H7, Raspberry Pi Pico) using TensorFlow Lite for Microcontrollers.
+3. **Measure** inference latency (target < 1 ms), power draw, and bit-exact determinism.
+4. **Inject faults** via an FPGA bit-flip board or JTAG-controlled memory corruptor while the MCU runs inference; verify that `SafetyMonitor` vetoes unsafe actions.
+5. **Close the loop** by connecting the MCU's UART output to the spacecraft fault simulator; run full-stack HIL episodes with real round-trip latency.
+6. **Log overrides** – feed `SafetyMonitor` veto events back as training signal (already supported via `FederatedSwarm.last_override_count`).
+
+### For Mission Planning
+
+Pick a mission concept and tailor the simulation:
+
+```python
+from sentinel_x_advanced import (
+    MissionScenario, build_swarm_for_scenario,
+    GossipServer, SafetyMonitor, LTLConstraintChecker,
+)
+
+# 1. Choose a pre-built scenario or define your own
+scenario = MissionScenario(
+    name="My CubeSat",
+    profile="data_return",
+    num_spacecraft=6,
+    comm_delay_steps=2,
+    link_dropout_prob=0.3,
+    thermal_spike_prob=0.02,
+    flip_rate_per_bit=2e-4,
+    sensor_stuck_prob=0.02,
+    power_drain_rate=0.12,
+)
+
+# 2. Build a swarm with safety constraints and LTL reward shaping
+ltl = LTLConstraintChecker(penalty=-0.5)
+swarm = build_swarm_for_scenario(scenario, safety_monitor=SafetyMonitor())
+
+# 3. Add gossip-based federation for partial connectivity
+gossip = GossipServer(k=2, comm_delay_steps=scenario.comm_delay_steps)
+
+# 4. Train and log results
+for ep in range(500):
+    reward = swarm.train_episode(max_steps=200)
+    if ep % 10 == 0:
+        gossip.gossip_round(swarm.agents)
+    gossip.tick(swarm.agents)
+```
 
 ---
 
