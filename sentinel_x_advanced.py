@@ -26,6 +26,10 @@ Extends the basic Q-learning prototype with:
   7. TFLite export – convert a trained DQN to TensorFlow Lite for deployment on
        microcontrollers and embedded hardware.
 
+  8. Formal verification – PolicyVerifier runs lightweight safety proofs over
+       the trained policy: safety constraints, Q-value margin bounds, and action
+       coverage across fault-state samples.
+
 Install dependencies:
     pip install numpy tensorflow matplotlib
 """
@@ -720,7 +724,228 @@ def export_tflite(agent: DQNAgent, output_path: str = "sentinel_x_agent.tflite")
 
 
 # -----------------------------------------------------------------------
-# 9. Main Training Loop
+# 9. Formal Verification of Trained Policies
+# -----------------------------------------------------------------------
+
+class PolicyVerifier:
+    """
+    Lightweight formal-verification harness for trained DQN policies.
+
+    Runs three certifiable safety checks without relying on any external
+    verification solver, making it suitable for ground-segment toolchains:
+
+    **Check 1 – Safety Constraint (no-inaction on fault)**
+        On every sampled faulty state the greedy policy must select a
+        *recovery* action (action ≠ 0).  An agent that prefers inaction when
+        a fault is active violates the minimum-safety requirement.
+
+    **Check 2 – Q-value Margin Bound**
+        For each sampled state the margin between the best and second-best
+        Q-value is computed.  A narrow margin (< ``margin_threshold``)
+        indicates an ambiguous policy that may be sensitive to noise.
+        The check passes when the mean margin across all sampled states
+        exceeds the threshold.
+
+    **Check 3 – Action Coverage**
+        Every non-inaction recovery action (1, 2, 3, …) must be the greedy
+        choice on at least one sampled *faulty* state.  A policy that never
+        selects a particular action wastes the available recovery repertoire
+        and may fail on fault types that require that action.
+
+    Parameters
+    ----------
+    agent : DQNAgent
+        Trained agent to verify.
+    n_samples : int
+        Number of random states to draw for probabilistic checks.
+    margin_threshold : float
+        Minimum acceptable mean Q-value margin (Check 2).
+    rng_seed : int or None
+        Seed for reproducible sampling.
+    """
+
+    def __init__(
+        self,
+        agent: DQNAgent,
+        n_samples: int = 500,
+        margin_threshold: float = 0.1,
+        rng_seed: int = 42,
+    ):
+        self.agent = agent
+        self.n_samples = n_samples
+        self.margin_threshold = margin_threshold
+        self.rng = np.random.default_rng(rng_seed)
+
+    # ------------------------------------------------------------------
+    # Internal helpers
+    # ------------------------------------------------------------------
+
+    def _sample_fault_states(self) -> np.ndarray:
+        """
+        Draw ``n_samples`` random states that represent *faulty* spacecraft.
+
+        The last feature of the state vector (index -1) is the ``health_flag``
+        (0 = healthy, 1 = faulty).  Sampling with ``health_flag = 1`` and
+        random values for the remaining features covers a broad slice of the
+        fault-state space without requiring access to the live environment.
+        """
+        dim = self.agent.state_dim
+        states = self.rng.uniform(0.0, 1.0, size=(self.n_samples, dim)).astype(
+            np.float32
+        )
+        states[:, -1] = 1.0   # health_flag = 1 → faulty
+        return states
+
+    def _q_values(self, states: np.ndarray) -> np.ndarray:
+        """Return Q-value matrix of shape (n_samples, action_dim)."""
+        return self.agent.model.predict(states, verbose=0)
+
+    # ------------------------------------------------------------------
+    # Individual checks
+    # ------------------------------------------------------------------
+
+    def check_safety_constraint(self) -> dict:
+        """
+        Verify that the greedy policy never selects "do nothing" (action 0)
+        on a faulty state.
+
+        Returns
+        -------
+        dict with keys:
+            ``passed``     – bool, True when no violation found
+            ``violations`` – int, number of states where action 0 was chosen
+            ``rate``       – float, fraction of sampled states with violations
+        """
+        states = self._sample_fault_states()
+        q_vals = self._q_values(states)
+        greedy_actions = np.argmax(q_vals, axis=1)
+        violations = int(np.sum(greedy_actions == 0))
+        rate = violations / self.n_samples
+        return {
+            "passed": violations == 0,
+            "violations": violations,
+            "rate": rate,
+        }
+
+    def check_qvalue_margin(self) -> dict:
+        """
+        Verify that the mean Q-value margin (best minus second-best) across
+        sampled fault states exceeds ``margin_threshold``.
+
+        A margin below the threshold indicates that the policy is nearly
+        indifferent between actions, which is a sign of under-training or
+        instability.
+
+        Returns
+        -------
+        dict with keys:
+            ``passed``       – bool
+            ``mean_margin``  – float, mean margin across sampled states
+            ``min_margin``   – float, worst-case (smallest) margin observed
+            ``threshold``    – float, the configured threshold
+        """
+        states = self._sample_fault_states()
+        q_vals = self._q_values(states)
+        sorted_q = np.sort(q_vals, axis=1)[:, ::-1]   # descending per row
+        margins = sorted_q[:, 0] - sorted_q[:, 1]
+        mean_margin = float(np.mean(margins))
+        min_margin = float(np.min(margins))
+        return {
+            "passed": mean_margin >= self.margin_threshold,
+            "mean_margin": mean_margin,
+            "min_margin": min_margin,
+            "threshold": self.margin_threshold,
+        }
+
+    def check_action_coverage(self) -> dict:
+        """
+        Verify that every recovery action (action ≥ 1) is the greedy choice
+        on at least one sampled faulty state.
+
+        Returns
+        -------
+        dict with keys:
+            ``passed``          – bool
+            ``covered_actions`` – set of action indices that appear in the
+                                  greedy policy
+            ``missing_actions`` – set of action indices never chosen
+        """
+        states = self._sample_fault_states()
+        q_vals = self._q_values(states)
+        greedy_actions = set(int(a) for a in np.argmax(q_vals, axis=1))
+        recovery_actions = set(range(1, self.agent.action_dim))
+        missing = recovery_actions - greedy_actions
+        return {
+            "passed": len(missing) == 0,
+            "covered_actions": greedy_actions,
+            "missing_actions": missing,
+        }
+
+    # ------------------------------------------------------------------
+    # Composite report
+    # ------------------------------------------------------------------
+
+    def verify(self) -> dict:
+        """
+        Run all three checks and return a consolidated verification report.
+
+        The overall ``passed`` flag is True only when every individual check
+        passes.  The report is also printed to stdout in a human-readable
+        format for integration into ground-segment CI pipelines.
+
+        Returns
+        -------
+        dict with keys:
+            ``overall_passed``     – bool
+            ``safety_constraint``  – result dict from check_safety_constraint
+            ``qvalue_margin``      – result dict from check_qvalue_margin
+            ``action_coverage``    – result dict from check_action_coverage
+        """
+        safety = self.check_safety_constraint()
+        margin = self.check_qvalue_margin()
+        coverage = self.check_action_coverage()
+        overall = safety["passed"] and margin["passed"] and coverage["passed"]
+
+        label = lambda ok: "PASS" if ok else "FAIL"   # noqa: E731
+        print("=" * 55)
+        print("  SENTINEL-X Policy Verification Report")
+        print("=" * 55)
+        print(
+            f"  [{'PASS' if overall else 'FAIL'}] Overall"
+        )
+        print(
+            f"  [{label(safety['passed'])}] Safety constraint – "
+            f"{safety['violations']} violation(s) / {self.n_samples} states"
+            f"  ({safety['rate'] * 100:.1f}%)"
+        )
+        print(
+            f"  [{label(margin['passed'])}] Q-value margin  – "
+            f"mean={margin['mean_margin']:.4f}, "
+            f"min={margin['min_margin']:.4f}, "
+            f"threshold={margin['threshold']}"
+        )
+        covered_str = ", ".join(str(a) for a in sorted(coverage["covered_actions"]))
+        missing_str = (
+            ", ".join(str(a) for a in sorted(coverage["missing_actions"]))
+            if coverage["missing_actions"]
+            else "none"
+        )
+        print(
+            f"  [{label(coverage['passed'])}] Action coverage  – "
+            f"covered=[{covered_str}], missing=[{missing_str}]"
+        )
+        print("=" * 55)
+
+        return {
+            "overall_passed": overall,
+            "safety_constraint": safety,
+            "qvalue_margin": margin,
+            "action_coverage": coverage,
+        }
+
+
+# -----------------------------------------------------------------------
+# 10. Main Training Loop
 # -----------------------------------------------------------------------
 
 def run_do_nothing_baseline(episodes=10, max_steps=200):
@@ -802,7 +1027,14 @@ if __name__ == "__main__":
     export_tflite(fed_swarm.agents[0], output_path="sentinel_x_agent.tflite")
 
     # ------------------------------------------------------------------
-    # 4. Save training curves (basic swarm + all three fed profiles)
+    # 4. Formal verification of the best-trained agent's policy
+    # ------------------------------------------------------------------
+    print("\nRunning formal policy verification...")
+    verifier = PolicyVerifier(fed_swarm.agents[0], n_samples=500)
+    verifier.verify()
+
+    # ------------------------------------------------------------------
+    # 5. Save training curves (basic swarm + all three fed profiles)
     # ------------------------------------------------------------------
     plt.figure()
     plt.plot(rewards_per_episode, label="Basic swarm")

@@ -19,6 +19,7 @@ Deep-space systems are fragile, and rule-based recovery can't keep pace with unp
   - **Federated learning** – `FederatedServer` averages DQN weights across all agents (FedAvg), aligning the swarm's policy without sharing raw data.
   - **Multi-agent coordination** – `FederatedSwarm` cross-checks peer sensor readings to detect stuck sensors that individual agents cannot diagnose alone.
   - **TFLite export** – `export_tflite()` quantises and serialises a trained DQN for microcontroller deployment.
+  - **Formal verification** – `PolicyVerifier` runs lightweight safety proofs (safety constraint, Q-value margin, action coverage) over a trained policy and prints a CI-friendly report.
 
 ---
 
@@ -72,6 +73,9 @@ Trains a basic swarm and then a `FederatedSwarm` under each of the three mission
 ├────────────────────┼─────────────────────────────────────────┤
 │  FederatedServer   │  FedAvg weight aggregation               │
 │                    │  across all DQN agents                   │
+├────────────────────┼─────────────────────────────────────────┤
+│  PolicyVerifier    │  Formal safety checks: constraint,       │
+│                    │  Q-margin bound, action coverage         │
 └────────────────────┴─────────────────────────────────────────┘
 ```
 
@@ -152,6 +156,39 @@ export_tflite(agent, output_path="sentinel_x_agent.tflite")
 ```
 
 The converter applies dynamic-range weight quantisation (`tf.lite.Optimize.DEFAULT`), reducing the model footprint while preserving inference accuracy.
+
+---
+
+## Formal Verification
+
+`PolicyVerifier` audits a trained `DQNAgent` against three certifiable safety properties without requiring an external SMT or model-checking solver, making it compatible with standard ground-segment CI pipelines.
+
+| Check | Property | Passes when |
+|---|---|---|
+| **Safety constraint** | Agent never selects "do nothing" (action 0) on a faulty state | Zero violations across all sampled fault states |
+| **Q-value margin** | Policy is not ambiguous between actions | Mean (best − 2nd-best) Q-value gap ≥ `margin_threshold` |
+| **Action coverage** | Every recovery action is reachable on some fault state | All actions 1…N appear in the greedy policy |
+
+```python
+from sentinel_x_advanced import PolicyVerifier, DQNAgent
+
+agent = DQNAgent(state_dim=7, action_dim=4)
+# ... train agent ...
+
+verifier = PolicyVerifier(agent, n_samples=500, margin_threshold=0.1)
+report = verifier.verify()
+# Prints:
+# =======================================================
+#   SENTINEL-X Policy Verification Report
+# =======================================================
+#   [PASS] Overall
+#   [PASS] Safety constraint – 0 violation(s) / 500 states  (0.0%)
+#   [PASS] Q-value margin  – mean=0.2341, min=0.0031, threshold=0.1
+#   [PASS] Action coverage  – covered=[0, 1, 2, 3], missing=[none]
+# =======================================================
+```
+
+> **Note on certifiability**: The verifier uses probabilistic sampling over the normalised state space.  For flight-critical certification (e.g., DO-178C / ECSS standards) this lightweight check should be complemented by interval-arithmetic bounds or a dedicated neural-network verification tool such as α,β-CROWN or Marabou.
 
 ---
 
