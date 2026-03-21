@@ -1,0 +1,55 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "sentinel-x"
+version = "0.3.0"
+description = "Self-healing spacecraft networks via federated reinforcement learning"
+readme = "README.md"
+license = { file = "LICENSE" }
+requires-python = ">=3.10"
+keywords = [
+    "reinforcement-learning",
+    "spacecraft",
+    "fault-detection",
+    "federated-learning",
+    "embedded-ai",
+    "space-autonomy",
+]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: Apache Software License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+dependencies = [
+    "numpy>=1.24",
+    "tensorflow>=2.12",
+    "matplotlib>=3.7",
+    "scikit-learn>=1.3",
+]
+
+[project.optional-dependencies]
+yaml = ["pyyaml>=6.0"]
+shap = ["shap>=0.43"]
+dev  = ["pytest>=7.0", "pyyaml>=6.0"]
+
+[project.urls]
+Homepage   = "https://github.com/danielnovais-tech/SENTINEL-X"
+Repository = "https://github.com/danielnovais-tech/SENTINEL-X"
+"Bug Tracker" = "https://github.com/danielnovais-tech/SENTINEL-X/issues"
+
+[project.scripts]
+sentinel-x-replay = "scripts.replay_tflite:run"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["sentinel_x*", "scripts*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts   = "-v --tb=short"

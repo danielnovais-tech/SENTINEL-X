@@ -1109,3 +1109,237 @@ class TestTfFunctionTrainStep:
         # Losses should be finite (not NaN/Inf)
         assert loss1 == loss1   # NaN check
         assert loss2 == loss2
+
+
+# ===========================================================================
+# Infrastructure tests (package, config, deployment script)
+# ===========================================================================
+
+class TestPackageImport:
+    """Verify that the sentinel_x package re-exports the full public API."""
+
+    def test_import_dqnagent(self):
+        import sentinel_x
+        assert hasattr(sentinel_x, "DQNAgent")
+
+    def test_import_spacecraft(self):
+        import sentinel_x
+        assert hasattr(sentinel_x, "Spacecraft")
+
+    def test_import_ppo_agent(self):
+        import sentinel_x
+        assert hasattr(sentinel_x, "PPOAgent")
+
+    def test_import_hierarchical_agent(self):
+        import sentinel_x
+        assert hasattr(sentinel_x, "HierarchicalAgent")
+
+    def test_import_curiosity_bonus(self):
+        import sentinel_x
+        assert hasattr(sentinel_x, "CuriosityBonus")
+
+    def test_import_safety_monitor(self):
+        import sentinel_x
+        assert hasattr(sentinel_x, "SafetyMonitor")
+
+    def test_import_mission_scenario(self):
+        import sentinel_x
+        assert hasattr(sentinel_x, "MissionScenario")
+
+    def test_import_load_config(self):
+        import sentinel_x
+        assert callable(sentinel_x.load_config)
+
+    def test_import_save_default_config(self):
+        import sentinel_x
+        assert callable(sentinel_x.save_default_config)
+
+    def test_all_list_complete(self):
+        import sentinel_x
+        for name in sentinel_x.__all__:
+            assert hasattr(sentinel_x, name), f"Missing: {name}"
+
+
+class TestConfig:
+    """Tests for sentinel_x.config (load_config / save_default_config)."""
+
+    def test_get_default_config_returns_dict(self):
+        from sentinel_x.config import get_default_config
+        cfg = get_default_config()
+        assert isinstance(cfg, dict)
+
+    def test_default_has_required_sections(self):
+        from sentinel_x.config import get_default_config
+        cfg = get_default_config()
+        for section in ("agent", "swarm", "federation", "mission",
+                        "faults", "training", "curiosity", "deployment"):
+            assert section in cfg, f"Missing section: {section}"
+
+    def test_load_config_none_returns_defaults(self):
+        from sentinel_x.config import load_config, get_default_config
+        cfg = load_config(None)
+        default = get_default_config()
+        assert cfg["agent"]["learning_rate"] == default["agent"]["learning_rate"]
+
+    def test_load_config_json(self):
+        import json
+        import tempfile
+        from sentinel_x.config import load_config
+        overrides = {"agent": {"learning_rate": 0.005}, "swarm": {"num_spacecraft": 3}}
+        with tempfile.NamedTemporaryFile(suffix=".json", mode="w",
+                                        delete=False) as f:
+            json.dump(overrides, f)
+            fname = f.name
+        try:
+            cfg = load_config(fname)
+            assert cfg["agent"]["learning_rate"] == pytest.approx(0.005)
+            assert cfg["swarm"]["num_spacecraft"] == 3
+            # defaults still present
+            assert cfg["agent"]["gamma"] == pytest.approx(0.99)
+        finally:
+            os.unlink(fname)
+
+    def test_load_config_yaml(self):
+        pytest.importorskip("yaml")
+        import tempfile
+        from sentinel_x.config import load_config
+        yaml_text = "agent:\n  learning_rate: 0.007\n"
+        with tempfile.NamedTemporaryFile(suffix=".yaml", mode="w",
+                                        delete=False) as f:
+            f.write(yaml_text)
+            fname = f.name
+        try:
+            cfg = load_config(fname)
+            assert cfg["agent"]["learning_rate"] == pytest.approx(0.007)
+        finally:
+            os.unlink(fname)
+
+    def test_save_default_config_json(self):
+        import json
+        import tempfile
+        from sentinel_x.config import save_default_config, get_default_config
+        with tempfile.NamedTemporaryFile(suffix=".json", delete=False) as f:
+            fname = f.name
+        try:
+            save_default_config(fname)
+            with open(fname) as fp:
+                saved = json.load(fp)
+            defaults = get_default_config()
+            assert saved["agent"]["batch_size"] == defaults["agent"]["batch_size"]
+        finally:
+            os.unlink(fname)
+
+    def test_save_default_config_yaml(self):
+        pytest.importorskip("yaml")
+        import tempfile
+        from sentinel_x.config import save_default_config, get_default_config
+        with tempfile.NamedTemporaryFile(suffix=".yaml", delete=False) as f:
+            fname = f.name
+        try:
+            save_default_config(fname)
+            from sentinel_x.config import load_config
+            cfg = load_config(fname)
+            defaults = get_default_config()
+            assert cfg["training"]["episodes"] == defaults["training"]["episodes"]
+        finally:
+            os.unlink(fname)
+
+    def test_load_config_missing_file_raises(self):
+        from sentinel_x.config import load_config
+        with pytest.raises(FileNotFoundError):
+            load_config("/nonexistent/path/to/config.yaml")
+
+    def test_load_config_unsupported_extension_raises(self):
+        import tempfile
+        from sentinel_x.config import load_config
+        with tempfile.NamedTemporaryFile(suffix=".toml", delete=False) as f:
+            fname = f.name
+        try:
+            with pytest.raises(ValueError, match="Unsupported config extension"):
+                load_config(fname)
+        finally:
+            os.unlink(fname)
+
+    def test_deep_merge_preserves_unmentioned_keys(self):
+        from sentinel_x.config import load_config
+        import json
+        import tempfile
+        # Only override one key; everything else should keep its default
+        overrides = {"training": {"episodes": 999}}
+        with tempfile.NamedTemporaryFile(suffix=".json", mode="w",
+                                        delete=False) as f:
+            json.dump(overrides, f)
+            fname = f.name
+        try:
+            cfg = load_config(fname)
+            assert cfg["training"]["episodes"] == 999
+            assert cfg["training"]["max_steps"] == 200   # untouched default
+        finally:
+            os.unlink(fname)
+
+
+class TestReplayTFLite:
+    """Tests for scripts/replay_tflite.py without requiring a real TFLite model."""
+
+    def test_builtin_scenario_length(self):
+        from scripts.replay_tflite import _builtin_scenario
+        states = _builtin_scenario(30)
+        assert len(states) == 30
+
+    def test_builtin_scenario_shape(self):
+        from scripts.replay_tflite import _builtin_scenario, STATE_DIM
+        states = _builtin_scenario(10)
+        for s in states:
+            assert s.shape == (STATE_DIM,)
+
+    def test_builtin_scenario_range(self):
+        from scripts.replay_tflite import _builtin_scenario
+        states = _builtin_scenario(20)
+        for s in states:
+            assert float(s.min()) >= 0.0
+            assert float(s.max()) <= 1.0
+
+    def test_load_scenario_json(self):
+        import json
+        import tempfile
+        from scripts.replay_tflite import _load_scenario, STATE_DIM
+        data = [[0.0] * STATE_DIM, [1.0] * STATE_DIM]
+        with tempfile.NamedTemporaryFile(suffix=".json", mode="w",
+                                        delete=False) as f:
+            json.dump(data, f)
+            fname = f.name
+        try:
+            states = _load_scenario(fname)
+            assert len(states) == 2
+            assert states[0].shape == (STATE_DIM,)
+        finally:
+            os.unlink(fname)
+
+    def test_load_scenario_wrong_dim_raises(self):
+        import json
+        import tempfile
+        from scripts.replay_tflite import _load_scenario
+        data = [[0.0, 1.0, 0.5]]   # wrong state dimension
+        with tempfile.NamedTemporaryFile(suffix=".json", mode="w",
+                                        delete=False) as f:
+            json.dump(data, f)
+            fname = f.name
+        try:
+            with pytest.raises(ValueError, match="expected"):
+                _load_scenario(fname)
+        finally:
+            os.unlink(fname)
+
+    def test_load_scenario_not_list_raises(self):
+        import json
+        import tempfile
+        from scripts.replay_tflite import _load_scenario
+        with tempfile.NamedTemporaryFile(suffix=".json", mode="w",
+                                        delete=False) as f:
+            json.dump({"state": [0.0]}, f)
+            fname = f.name
+        try:
+            with pytest.raises(ValueError, match="list"):
+                _load_scenario(fname)
+        finally:
+            os.unlink(fname)

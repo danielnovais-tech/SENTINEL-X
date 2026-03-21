@@ -13,13 +13,15 @@ Deep-space systems are fragile, and rule-based recovery can't keep pace with unp
 - **Basic Q-learning simulation** (`sentinel_x.py`) – A tabular Q-learning agent learns to recover a simulated spacecraft from random faults (memory corruption, sensor failure, CPU hang).
 - **Advanced DQN simulation** (`sentinel_x_advanced.py`) – Extends the prototype with:
   - **Realistic fault generators**: `MemoryArray` (SEUs/bit flips), `Sensor` (Gaussian noise + stuck-at), `ThermalSubsystem` (overheating/overcooling), `PowerSubsystem` (brownout), `AttitudeControlSubsystem` (gyro-drift/tumble), and `CommSubsystem` (link-quality degradation/dropout).
-  - **Deep Q-Network (DQN) agent** using TensorFlow/Keras with experience replay and a separate target network.
+  - **Deep Q-Network (DQN) agent** using TensorFlow/Keras with experience replay and a separate target network.  Training uses a `@tf.function`-compiled Bellman update for ~2–4× faster training.
   - **Swarm simulation** – multiple spacecraft each managed by an independent DQN agent.
   - **Mission-specific reward profiles** – `MissionProfile` lets you tune the reward function to mission priorities (balanced, data-return, lifespan, power-constrained) with runtime-adjustable weights via `update_weights()`.
   - **Federated learning** – `FederatedServer` averages DQN weights across all agents (FedAvg), with optional deep-space communication latency (`comm_delay_steps`) and stochastic link dropout (`link_dropout_prob`).
   - **Gossip-based federation** – `GossipServer` provides a decentralised alternative where each spacecraft gossips with k random neighbours, scaling to large constellations without a central server.
   - **Multi-agent coordination** – `FederatedSwarm` cross-checks peer sensor readings to detect stuck sensors that individual agents cannot diagnose alone.
+  - **Cooperative MARL** – `cooperative_bonus` parameter adds a per-step team reward when all spacecraft stay healthy.
   - **TFLite export** – `export_tflite()` (dynamic-range) and `export_tflite_int8()` (full int8, for Cortex-M / MCU) serialise a trained DQN for embedded deployment.
+  - **Embedded deployment script** – `scripts/replay_tflite.py` loads the int8 model and replays fault scenarios on any host (workstation, RPi, STM32), reporting per-step latency.
   - **Safety monitor** – `SafetyMonitor` is a rule-based FDIR veto layer: never "do nothing" on a fault, never reset hardware on critically low power.  Pass it to `FederatedSwarm` via `safety_monitor=` to train the agent to avoid veto-triggering actions.
   - **Adversarial testing** – `AdversarialTester` uses FGSM to find minimal state perturbations that flip the greedy action; `augment_replay_buffer()` injects adversarial transitions to harden the policy; `certify_robustness()` binary-searches the minimum per-state perturbation radius.
   - **Formal verification** – `PolicyVerifier` runs lightweight safety proofs (safety constraint, Q-value margin, action coverage) over a trained policy and prints a CI-friendly report.
@@ -27,6 +29,12 @@ Deep-space systems are fragile, and rule-based recovery can't keep pace with unp
   - **Decision-tree extraction** – `extract_decision_tree()` trains a scikit-learn `DecisionTreeClassifier` surrogate via imitation learning, providing a certifiable, human-readable proxy for the DQN.
   - **Mission scenario presets** – `MissionScenario.lunar_gateway()`, `.mars_orbiter()`, `.cubesat_swarm()` bundle fault-model and reward-profile parameters for three real mission concepts; `build_swarm_for_scenario()` builds the ready-to-train swarm.
   - **Federation benchmark** – `benchmark_federation()` compares FedAvg and gossip under configurable link-dropout rates and prints a summary table.
+  - **PPO agent** – `PPOAgent` provides a stable actor-critic alternative to DQN, more suitable for high-variance reward signals.
+  - **Hierarchical RL** – `HierarchicalAgent` separates mission-phase selection (high-level) from subsystem recovery (low-level).
+  - **Curiosity bonus** – `CuriosityBonus` provides count-based intrinsic exploration reward for novel fault-state combinations.
+  - **Explainability** – `DQNAgent.explain_action()` returns per-feature gradient saliency (SHAP when installed) to explain agent decisions.
+  - **Online adaptation** – `DQNAgent.adapt_online()` fine-tunes the policy on recent telemetry to compensate for hardware drift.
+  - **YAML/JSON configuration** – `sentinel_x.config` with `load_config()` and `save_default_config()` lets all hyperparameters be driven from a config file.
 
 ---
 
@@ -444,4 +452,249 @@ Moving from simulation to real hardware requires careful validation:
 - **Simulation Fidelity**: Physics-based fault models (radiation dose, sensor drift) are needed before deployment validation.
 - **Continuous Learning**: Onboard retraining is compute-limited; periodic ground-simulated policy updates are more practical.
 - **Multi-Agent Swarm**: Distributed RL with shared experiences can further improve swarm resilience when inter-spacecraft communication is available.
+
+
+---
+
+## Installation (Package)
+
+Install the `sentinel_x` package directly from source:
+
+```bash
+git clone https://github.com/danielnovais-tech/SENTINEL-X.git
+cd SENTINEL-X
+pip install -e ".[yaml]"   # include PyYAML for YAML config support
+```
+
+Or install dependencies only:
+
+```bash
+pip install -r requirements.txt
+pip install pyyaml          # optional, for YAML config files
+```
+
+---
+
+## YAML / JSON Configuration
+
+All hyperparameters can be driven from a single configuration file instead of
+modifying source code.
+
+### Quickstart
+
+```bash
+# Write the built-in defaults to a YAML template
+python - <<'EOF'
+from sentinel_x.config import save_default_config
+save_default_config("sentinel_x_config.yaml")
+EOF
+
+# Edit sentinel_x_config.yaml, then load in your training script:
+python - <<'EOF'
+from sentinel_x import DQNAgent, FederatedSwarm, MissionProfile, load_config
+
+cfg = load_config("sentinel_x_config.yaml")
+
+agent = DQNAgent(
+    state_dim=cfg["agent"]["state_dim"],
+    action_dim=cfg["agent"]["action_dim"],
+    learning_rate=cfg["agent"]["learning_rate"],
+    gamma=cfg["agent"]["gamma"],
+)
+
+swarm = FederatedSwarm(
+    num_spacecraft=cfg["swarm"]["num_spacecraft"],
+    action_dim=cfg["agent"]["action_dim"],
+    mission_profile=MissionProfile(cfg["mission"]["profile"]),
+    federated_interval=cfg["federation"]["federated_interval"],
+    comm_delay_steps=cfg["federation"]["comm_delay_steps"],
+    link_dropout_prob=cfg["federation"]["link_dropout_prob"],
+    cooperative_bonus=cfg["swarm"].get("cooperative_bonus", 0.0),
+)
+EOF
+```
+
+Both YAML (`.yaml`, `.yml`) and JSON (`.json`) files are supported. Partial
+overrides are allowed — unspecified keys keep their built-in defaults.
+
+---
+
+## New Algorithms (v0.3)
+
+### Proximal Policy Optimisation (PPO)
+
+`PPOAgent` is a drop-in DQN alternative with clipped actor-critic updates:
+
+```python
+from sentinel_x import PPOAgent, Spacecraft
+import numpy as np
+
+agent = PPOAgent(state_dim=11, action_dim=4)
+sc = Spacecraft()
+sc.reset()
+
+for step in range(200):
+    state = np.append(sc.get_state(), 0.0)
+    action, log_prob, value = agent.act(state)
+    sc.step()
+    reward = 1.0 if sc.is_operational() else -1.0
+    agent.remember(state, action, reward, log_prob, value, done=(step == 199))
+
+loss = agent.update()   # PPO gradient update over the collected trajectory
+```
+
+### Hierarchical RL
+
+`HierarchicalAgent` runs a two-level policy: a high-level DQN selects a
+mission phase (`NOMINAL` / `CAUTIOUS` / `EMERGENCY`) every `phase_duration`
+steps; a low-level DQN selects the recovery action conditioned on the phase:
+
+```python
+from sentinel_x import HierarchicalAgent
+
+hier = HierarchicalAgent(state_dim=11, action_dim=4, phase_duration=10)
+action = hier.act(state)
+print(hier.current_phase_name)   # "NOMINAL" | "CAUTIOUS" | "EMERGENCY"
+hier.remember(state, action, reward, next_state, done)
+hier.replay()
+```
+
+### Curiosity Bonus
+
+`CuriosityBonus` adds count-based intrinsic reward (`1/√visits`) to
+encourage exploration of rare fault combinations:
+
+```python
+from sentinel_x import CuriosityBonus
+
+curiosity = CuriosityBonus(bins=5, bonus_scale=0.1)
+intrinsic = curiosity.bonus(state)    # high on first visit, decays with revisits
+total_reward = extrinsic + intrinsic
+```
+
+### Explainability
+
+`DQNAgent.explain_action()` returns feature-importance scores for the chosen
+action using gradient saliency (or SHAP if installed):
+
+```python
+explanation = agent.explain_action(state)
+# {'best_action': 3, 'q_values': [...], 'saliency': array([...]), 'method': 'gradient'}
+
+top = sorted(enumerate(explanation["saliency"]),
+             key=lambda x: abs(x[1]), reverse=True)[:3]
+print("Top driving features:", top)
+```
+
+### Online Adaptation
+
+`DQNAgent.adapt_online()` fine-tunes the policy on a window of recent
+telemetry to handle hardware drift without full retraining:
+
+```python
+# Collect recent transitions (state, action, reward, next_state, done)
+recent = [...]   # last 200 steps
+
+mean_loss = agent.adapt_online(recent, n_steps=5)
+print(f"Adaptation loss: {mean_loss:.4f}")
+```
+
+### Cooperative MARL
+
+Pass `cooperative_bonus` to `FederatedSwarm` to add a per-step team reward
+when *all* spacecraft are simultaneously healthy:
+
+```python
+from sentinel_x import FederatedSwarm, MissionProfile
+
+swarm = FederatedSwarm(
+    num_spacecraft=5,
+    action_dim=4,
+    mission_profile=MissionProfile("balanced"),
+    cooperative_bonus=0.5,    # +0.5 per step when all healthy; -0.125 otherwise
+)
+```
+
+---
+
+## Embedded Deployment (Raspberry Pi / STM32)
+
+After training, export the int8 model and replay a fault scenario to measure
+inference latency:
+
+```bash
+# Step 1 – export the int8 model
+python sentinel_x_advanced.py   # writes sentinel_x_model_int8.tflite
+
+# Step 2 – replay built-in scenario (works on RPi with tflite-runtime)
+python scripts/replay_tflite.py
+
+# Step 3 – use a custom scenario file
+python scripts/replay_tflite.py \
+    --model sentinel_x_model_int8.tflite \
+    --scenario my_fault_scenario.json \
+    --steps 100
+```
+
+**RPi-only install** (no full TensorFlow needed):
+
+```bash
+pip install tflite-runtime   # ~1 MB wheel vs ~500 MB for TF
+python scripts/replay_tflite.py
+```
+
+The script prints per-step latency in milliseconds and a final summary with
+min / mean / max / p95 latency and peak RSS memory.
+
+---
+
+## Continuous Integration
+
+The repository includes a GitHub Actions CI workflow
+(`.github/workflows/ci.yml`) that runs the full test suite on Python 3.10
+and 3.11 on every push and pull request.
+
+Run locally:
+
+```bash
+pip install pytest
+python -m pytest tests/ -v
+```
+
+---
+
+## Package Structure
+
+```
+SENTINEL-X/
+├── sentinel_x/                 # importable package (new in v0.3)
+│   ├── __init__.py             # re-exports full public API
+│   └── config.py               # YAML/JSON configuration loader
+├── scripts/
+│   └── replay_tflite.py        # embedded deployment / latency benchmark
+├── tests/
+│   └── test_sentinel_x.py      # 163 pytest tests
+├── sentinel_x_advanced.py      # canonical implementation
+├── sentinel_x_config.yaml      # default configuration template
+├── pyproject.toml              # PEP 517 packaging metadata
+├── requirements.txt
+└── .github/
+    └── workflows/
+        └── ci.yml              # GitHub Actions CI pipeline
+```
+
+---
+
+## Testing
+
+```bash
+# Run all 163 tests
+python -m pytest tests/ -v
+
+# Run a specific test class
+python -m pytest tests/ -k TestPPOAgent -v
+
+# Run config / package / deployment script tests only
+python -m pytest tests/ -k "TestPackage or TestConfig or TestReplayTFLite" -v
+```
 

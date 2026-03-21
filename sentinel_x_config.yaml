@@ -1,0 +1,72 @@
+# sentinel_x_config.yaml
+# ========================
+# Default configuration for SENTINEL-X.
+# Edit this file to override any setting without touching the source code.
+# All values shown here are the built-in defaults.
+
+# ── DQN agent ──────────────────────────────────────────────────────────────
+agent:
+  state_dim: 11          # size of the (normalised) state vector
+  action_dim: 4          # number of discrete recovery actions
+  learning_rate: 0.001
+  gamma: 0.99            # discount factor
+  epsilon: 1.0           # initial exploration probability
+  epsilon_min: 0.01
+  epsilon_decay: 0.995
+  memory_size: 2000
+  batch_size: 32
+
+# ── Swarm ──────────────────────────────────────────────────────────────────
+swarm:
+  num_spacecraft: 5
+  cooperative_bonus: 0.0   # set > 0 to enable cooperative MARL team reward
+
+# ── Federated learning ─────────────────────────────────────────────────────
+federation:
+  federated_interval: 10   # episodes between FedAvg aggregations
+  comm_delay_steps: 0      # simulated light-time delay (episodes)
+  link_dropout_prob: 0.0   # probability any agent drops out of an aggregation
+
+# ── Mission profile ────────────────────────────────────────────────────────
+mission:
+  # profile: one of "balanced" | "data_return" | "lifespan" | "power_constrained"
+  profile: "balanced"
+  recovery_bonus_scale: 1.0
+  fault_penalty_scale: 1.0
+
+# ── Fault model ────────────────────────────────────────────────────────────
+faults:
+  flip_rate_per_bit: 0.0001   # single-event upset probability per bit per step
+  sensor_stuck_prob: 0.01     # probability a sensor becomes stuck each step
+  thermal_drift_std: 0.5      # temperature random-walk std (°C per step)
+  thermal_spike_prob: 0.02    # probability of a sudden thermal spike
+  power_drain_rate: 0.01      # fractional power drained per step
+
+# ── Training loop ──────────────────────────────────────────────────────────
+training:
+  episodes: 200
+  max_steps: 200
+  target_update_interval: 10  # steps between DQN target-network updates
+
+# ── Curiosity bonus ────────────────────────────────────────────────────────
+curiosity:
+  enabled: false
+  bins: 5           # discretisation bins per state dimension
+  bonus_scale: 0.1  # peak novelty bonus magnitude
+  clip: 1.0         # hard upper bound on bonus
+
+# ── PPO agent ──────────────────────────────────────────────────────────────
+ppo:
+  lr: 0.0003
+  gamma: 0.99
+  clip_ratio: 0.2
+  epochs: 4
+
+# ── Hierarchical agent ─────────────────────────────────────────────────────
+hierarchical:
+  n_phases: 3           # NOMINAL / CAUTIOUS / EMERGENCY
+  phase_duration: 10    # steps between high-level phase decisions
+
+# ── Embedded deployment ────────────────────────────────────────────────────
+deployment:
+  tflite_int8_path: "sentinel_x_model_int8.tflite"
