@@ -4,8 +4,12 @@ SENTINEL-X Advanced: Realistic Faults, DQN, Swarm, Federated Learning & Coordina
 Extends the basic Q-learning prototype with:
 
   1. Realistic fault generators:
-       - MemoryArray – simulates single-event upsets (bit flips) in memory
-       - Sensor      – models Gaussian noise and stuck-at faults
+       - MemoryArray        – simulates single-event upsets (bit flips) in memory
+       - Sensor             – models Gaussian noise and stuck-at faults
+       - ThermalSubsystem   – temperature random-walk with overheating /
+                              overcooling fault detection
+       - PowerSubsystem     – power-budget drain model with brownout fault
+                              detection
 
   2. Deep Q-Network (DQN) agent using TensorFlow/Keras with:
        - Experience replay buffer
@@ -15,10 +19,11 @@ Extends the basic Q-learning prototype with:
   3. Swarm simulation – N spacecraft each managed by an independent DQN agent.
 
   4. Mission-specific reward profiles – tailor optimisation to mission priorities
-       (balanced / maximise data return / extend lifespan).
+       (balanced / maximise data return / extend lifespan / power-constrained).
 
   5. Federated learning – a central FederatedServer averages DQN weights across
-       all agents (FedAvg) at configurable intervals.
+       all agents (FedAvg) at configurable intervals, with optional deep-space
+       communication latency simulation via ``comm_delay_steps``.
 
   6. Multi-agent coordination – spacecraft cross-check peer sensor readings to
        detect stuck sensors that an individual agent cannot diagnose alone.
@@ -97,6 +102,111 @@ class Sensor:
     def reset(self):
         self.is_stuck = False
         self.stuck_value = None
+
+
+class ThermalSubsystem:
+    """
+    Simulates spacecraft thermal control with overheating and overcooling faults.
+
+    The temperature undergoes a Gaussian random walk each step with occasional
+    large spikes representing eclipse transitions or heater failures.  A fault
+    is declared when the temperature drifts outside the safe operating range.
+    """
+
+    NOMINAL_TEMP = 20.0      # °C
+    FAULT_TEMP_HIGH = 75.0   # °C – overheating threshold
+    FAULT_TEMP_LOW = -20.0   # °C – overcooling threshold
+
+    def __init__(
+        self,
+        nominal_temp: float = NOMINAL_TEMP,
+        fault_temp_high: float = FAULT_TEMP_HIGH,
+        fault_temp_low: float = FAULT_TEMP_LOW,
+        drift_std: float = 0.1,
+        spike_prob: float = 0.005,
+    ):
+        self.nominal_temp = nominal_temp
+        self.fault_temp_high = fault_temp_high
+        self.fault_temp_low = fault_temp_low
+        self.drift_std = drift_std
+        self.spike_prob = spike_prob
+        self.temperature = nominal_temp
+        self.is_faulted = False
+
+    def step(self) -> float:
+        """Advance thermal state; return current temperature."""
+        self.temperature += np.random.normal(0.0, self.drift_std)
+        if random.random() < self.spike_prob:
+            # Random thermal spike: positive (overheating) or negative (cooling)
+            self.temperature += float(
+                np.random.choice([-1, 1]) * np.random.uniform(5.0, 20.0)
+            )
+        if (self.temperature > self.fault_temp_high
+                or self.temperature < self.fault_temp_low):
+            self.is_faulted = True
+        return self.temperature
+
+    @property
+    def fault_flag(self) -> int:
+        """1 if the thermal system is currently faulted, else 0."""
+        return 1 if self.is_faulted else 0
+
+    def reset(self) -> None:
+        self.temperature = self.nominal_temp
+        self.is_faulted = False
+
+
+class PowerSubsystem:
+    """
+    Simulates spacecraft power budget with gradual depletion and brownout faults.
+
+    The charge level follows a near-zero net balance (generation ≈ consumption)
+    with occasional sudden drain events representing solar-panel shadowing or
+    high-power fault responses.  A brownout fault is declared when the charge
+    drops below ``fault_threshold``.
+    """
+
+    def __init__(
+        self,
+        capacity: float = 100.0,
+        drain_rate: float = 0.10,
+        recharge_rate: float = 0.08,
+        event_prob: float = 0.003,
+        fault_threshold: float = 10.0,
+    ):
+        self.capacity = capacity
+        self.drain_rate = drain_rate
+        self.recharge_rate = recharge_rate
+        self.event_prob = event_prob
+        self.fault_threshold = fault_threshold
+        self.charge = capacity
+        self.is_faulted = False
+
+    def step(self) -> float:
+        """Advance power state; return current charge level."""
+        net = (self.recharge_rate - self.drain_rate
+               + np.random.normal(0.0, 0.02))
+        self.charge = float(np.clip(self.charge + net, 0.0, self.capacity))
+        if random.random() < self.event_prob:
+            # Sudden power drain event (e.g., solar panel shadowing)
+            self.charge = float(
+                np.clip(
+                    self.charge - np.random.uniform(5.0, 20.0),
+                    0.0, self.capacity,
+                )
+            )
+        if self.charge < self.fault_threshold:
+            self.is_faulted = True
+        return self.charge
+
+    @property
+    def level_norm(self) -> float:
+        """Normalised charge in [0, 1]."""
+        return self.charge / self.capacity
+
+    def reset(self) -> None:
+        self.charge = self.capacity
+        self.is_faulted = False
 
 
 # -----------------------------------------------------------------------
@@ -214,13 +324,15 @@ class DQNAgent:
 
 class Spacecraft:
     """
-    Spacecraft combining a MemoryArray and a Sensor subsystem.
+    Spacecraft combining MemoryArray, Sensor, ThermalSubsystem, and
+    PowerSubsystem fault subsystems.
 
-    Base state vector (6 features, all normalised to [0, 1]):
+    Base state vector (8 features, all normalised to [0, 1]):
         [mem_error_ratio, parity_flag, sensor_deviation_norm,
-         sensor_stuck_flag, time_since_recovery_norm, health_flag]
+         sensor_stuck_flag, time_since_recovery_norm, health_flag,
+         thermal_fault_flag, power_level_norm]
 
-    Note: FederatedSwarm extends this to a 7-feature vector by appending a
+    Note: FederatedSwarm extends this to a 9-feature vector by appending a
     peer_sensor_deviation_norm coordination feature via
     ``_get_coordinated_state()``.
     """
@@ -233,6 +345,8 @@ class Spacecraft:
         """Initialise (or re-initialise) all mutable state for a new episode."""
         self.memory = MemoryArray(size_bits=1024, flip_rate_per_bit=1e-4)
         self.sensor = Sensor(true_value=25.0, noise_std=0.5, stuck_prob=0.01)
+        self.thermal = ThermalSubsystem()
+        self.power = PowerSubsystem()
         self.healthy = True
         self.time_healthy = 0
         self.time_total = 0
@@ -260,16 +374,19 @@ class Spacecraft:
 
         self.mem_errors = self.memory.step()
         self.sensor_reading = self.sensor.step()
+        self.thermal.step()
+        self.power.step()
 
         self.parity_ok = self.memory.check_parity() == 0
         mem_too_many = self.mem_errors > 50
         self.sensor_stuck = self.sensor.is_stuck
 
-        if mem_too_many or not self.parity_ok or self.sensor_stuck:
+        if (mem_too_many or not self.parity_ok or self.sensor_stuck
+                or self.thermal.is_faulted or self.power.is_faulted):
             self.healthy = False
 
     def get_state(self):
-        """Return a normalised state vector for the DQN."""
+        """Return a normalised 8-feature state vector for the DQN."""
         mem_err_norm = min(self.mem_errors / self.max_memory_errors, 1.0)
         parity_flag = 0 if self.parity_ok else 1
         dev = abs(self.sensor_reading - self.sensor.true_value)
@@ -281,7 +398,8 @@ class Spacecraft:
 
         return np.array(
             [mem_err_norm, parity_flag, dev_norm, stuck_flag,
-             time_since_norm, health_flag],
+             time_since_norm, health_flag,
+             self.thermal.fault_flag, self.power.level_norm],
             dtype=np.float32,
         )
 
@@ -291,9 +409,10 @@ class Spacecraft:
 
         Actions:
             0: do nothing
-            1: restart subsystem  (resets memory and sensor)
-            2: switch to redundant hardware (full reset)
-            3: safe mode (targeted: fixes stuck sensor or parity error)
+            1: restart subsystem  (resets memory, sensor, and thermal subsystems)
+            2: switch to redundant hardware (full reset of all subsystems)
+            3: safe mode (targeted: fixes stuck sensor, parity error, thermal
+                          fault, or low-power condition)
         """
         self.recovery_attempts += 1
         success = False
@@ -303,10 +422,13 @@ class Spacecraft:
         elif action == 1:   # restart
             self.memory.reset()
             self.sensor.reset()
+            self.thermal.reset()
             success = True
         elif action == 2:   # switch to redundant
             self.memory.reset()
             self.sensor.reset()
+            self.thermal.reset()
+            self.power.reset()
             success = True
         elif action == 3:   # safe mode
             if self.sensor_stuck:
@@ -314,6 +436,12 @@ class Spacecraft:
                 success = True
             if not self.parity_ok:
                 self.memory.reset()
+                success = True
+            if self.thermal.is_faulted:
+                self.thermal.reset()
+                success = True
+            if self.power.is_faulted:
+                self.power.reset()
                 success = True
 
         if success:
@@ -417,7 +545,7 @@ class MissionProfile:
     """
     Encapsulates reward shaping based on mission objectives.
 
-    Three built-in profiles are provided:
+    Four built-in profiles are provided:
 
     * **BALANCED** (default)
         General-purpose recovery. Equal weight on uptime and recovery cost.
@@ -429,17 +557,28 @@ class MissionProfile:
     * **EXTEND_LIFESPAN**
         Preserve redundant hardware. Prefer cheap recovery actions (restart,
         safe mode) and accept brief downtime to avoid wearing out spares.
+
+    * **POWER_CONSTRAINED**
+        Optimise for power budgets. Penalise redundant hardware switches
+        (high current draw) and reward power-efficient recovery actions.
     """
 
     BALANCED = "balanced"
     MAXIMIZE_DATA_RETURN = "data_return"
     EXTEND_LIFESPAN = "lifespan"
+    POWER_CONSTRAINED = "power_constrained"
 
     def __init__(self, profile: str = BALANCED):
-        if profile not in (self.BALANCED, self.MAXIMIZE_DATA_RETURN, self.EXTEND_LIFESPAN):
+        valid = (
+            self.BALANCED,
+            self.MAXIMIZE_DATA_RETURN,
+            self.EXTEND_LIFESPAN,
+            self.POWER_CONSTRAINED,
+        )
+        if profile not in valid:
             raise ValueError(
                 f"Unknown profile '{profile}'. Choose from: "
-                f"{self.BALANCED}, {self.MAXIMIZE_DATA_RETURN}, {self.EXTEND_LIFESPAN}"
+                + ", ".join(valid)
             )
         self.profile = profile
 
@@ -482,6 +621,24 @@ class MissionProfile:
                 reward -= 2.0
             return reward
 
+        elif self.profile == self.POWER_CONSTRAINED:
+            # Favour power-efficient actions (restart, safe mode) and
+            # discourage redundant hardware switches that draw high current.
+            reward = 1.0 if now_operational else -1.0
+            if not was_healthy and now_operational:
+                reward += 5.0
+                if action in (1, 3):   # restart / safe mode – low power draw
+                    reward += 1.0
+                elif action == 2:       # redundant switch – high power draw
+                    reward -= 2.0
+            elif action != 0 and not now_operational:
+                reward -= 2.0
+            # Additional deterrent: penalise action 2 on a healthy spacecraft
+            # to prevent unnecessary high-power-draw operations.
+            if action == 2 and was_healthy:
+                reward -= 1.0
+            return reward
+
         else:  # BALANCED (default)
             reward = 1.0 if now_operational else -1.0
             if action != 0 and now_operational and not was_healthy:
@@ -502,14 +659,30 @@ class FederatedServer:
     After aggregation every agent receives the same globally averaged
     weights, promoting convergence while still allowing each agent to
     continue learning from its own local experience.
+
+    Parameters
+    ----------
+    comm_delay_steps : int
+        Number of training episodes the aggregated weights are held in a
+        queue before being distributed to the agents.  A non-zero value
+        simulates the round-trip light-time delay of deep-space
+        communication links (e.g., Earth–Mars ≈ 3–22 minutes one-way,
+        translating to tens of training episodes in simulation time).
+        Set to 0 (default) for immediate distribution.
     """
+
+    def __init__(self, comm_delay_steps: int = 0):
+        self.comm_delay_steps = comm_delay_steps
+        self._queue: list = []   # list of [remaining_episodes, avg_weights]
 
     def aggregate(self, agents: list) -> None:
         """
-        Average online-network weights across all agents and redistribute.
+        Average online-network weights across all agents and enqueue.
 
-        The target network of each agent is also synchronised so that the
-        next round of local training starts from a consistent baseline.
+        If ``comm_delay_steps`` is zero the averaged weights are applied
+        immediately.  Otherwise they are queued; call ``tick()`` once per
+        training episode to advance the delay counter and release weights
+        when due.
 
         Parameters
         ----------
@@ -524,6 +697,30 @@ class FederatedServer:
             np.mean([all_weights[a][layer] for a in range(len(agents))], axis=0)
             for layer in range(n_layers)
         ]
+        if self.comm_delay_steps > 0:
+            self._queue.append([self.comm_delay_steps, avg_weights])
+        else:
+            self._apply(agents, avg_weights)
+
+    def tick(self, agents: list) -> None:
+        """
+        Advance the communication delay queue by one episode.
+
+        Any weight update whose remaining delay reaches zero is immediately
+        applied to all agents.  Call this once per training episode inside
+        ``FederatedSwarm.train_episode()``.
+        """
+        still_pending = []
+        for remaining, avg_weights in self._queue:
+            remaining -= 1
+            if remaining <= 0:
+                self._apply(agents, avg_weights)
+            else:
+                still_pending.append([remaining, avg_weights])
+        self._queue = still_pending
+
+    def _apply(self, agents: list, avg_weights: list) -> None:
+        """Distribute *avg_weights* to every agent's online and target networks."""
         for agent in agents:
             agent.model.set_weights(avg_weights)
             agent.update_target()
@@ -538,10 +735,11 @@ class FederatedSwarm(Swarm):
     Extends Swarm with federated learning, sensor cross-checking, and
     mission-profile reward shaping.
 
-    The state vector is extended to 7 features:
+    The state vector is extended to 9 features:
 
         [mem_error_ratio, parity_flag, sensor_deviation_norm,
          sensor_stuck_flag, time_since_recovery_norm, health_flag,
+         thermal_fault_flag, power_level_norm,
          peer_sensor_deviation_norm]   ← coordination feature
 
     Parameters
@@ -554,9 +752,13 @@ class FederatedSwarm(Swarm):
         Reward-shaping strategy. Defaults to MissionProfile.BALANCED.
     federated_interval : int
         Number of episodes between federated weight aggregations.
+    comm_delay_steps : int
+        Communication latency in episodes before aggregated weights reach
+        agents.  Simulates deep-space round-trip light time (default 0 =
+        immediate).
     """
 
-    COORD_STATE_DIM = 7   # base 6 features + 1 peer-sensor deviation feature
+    COORD_STATE_DIM = 9   # base 8 features + 1 peer-sensor deviation feature
 
     def __init__(
         self,
@@ -564,9 +766,10 @@ class FederatedSwarm(Swarm):
         action_dim: int,
         mission_profile: MissionProfile = None,
         federated_interval: int = 10,
+        comm_delay_steps: int = 0,
     ):
         super().__init__(num_spacecraft, self.COORD_STATE_DIM, action_dim)
-        self.server = FederatedServer()
+        self.server = FederatedServer(comm_delay_steps=comm_delay_steps)
         self.mission_profile = mission_profile or MissionProfile()
         self.federated_interval = federated_interval
         self._episode_count = 0
@@ -584,7 +787,7 @@ class FederatedSwarm(Swarm):
         A spacecraft whose reading is an outlier among its peers is likely
         experiencing a stuck-sensor fault, even if it cannot detect this
         from its own readings alone.  The per-spacecraft
-        ``_peer_sensor_deviation`` attribute becomes the 7th state feature
+        ``_peer_sensor_deviation`` attribute becomes the 9th state feature
         fed to the DQN, enabling coordinated fault diagnosis.
         """
         readings = np.array(
@@ -602,8 +805,8 @@ class FederatedSwarm(Swarm):
             )
 
     def _get_coordinated_state(self, sc: Spacecraft) -> np.ndarray:
-        """Return the 7-feature state vector for *sc*, including peer deviation."""
-        base = sc.get_state()                                          # shape (6,)
+        """Return the 9-feature state vector for *sc*, including peer deviation."""
+        base = sc.get_state()                                          # shape (8,)
         peer = np.float32(getattr(sc, "_peer_sensor_deviation", 0.0))
         return np.append(base, peer)
 
@@ -665,6 +868,10 @@ class FederatedSwarm(Swarm):
         self._episode_count += 1
         if self._episode_count % self.federated_interval == 0:
             self.server.aggregate(self.agents)
+
+        # Advance the communication delay queue regardless of whether we
+        # triggered an aggregation this episode.
+        self.server.tick(self.agents)
 
         return float(np.mean(episode_rewards))
 
@@ -971,7 +1178,7 @@ if __name__ == "__main__":
     # ------------------------------------------------------------------
     # 1. Basic swarm (independent agents, no federation)
     # ------------------------------------------------------------------
-    STATE_DIM = 6
+    STATE_DIM = 8   # 8-feature state: mem/sensor/thermal/power + health/time
     swarm = Swarm(SWARM_SIZE, STATE_DIM, ACTION_DIM)
     rewards_per_episode = []
 
@@ -1001,6 +1208,7 @@ if __name__ == "__main__":
         MissionProfile.BALANCED,
         MissionProfile.MAXIMIZE_DATA_RETURN,
         MissionProfile.EXTEND_LIFESPAN,
+        MissionProfile.POWER_CONSTRAINED,
     ):
         print(f"\nProfile: {profile_name}")
         fed_swarm = FederatedSwarm(
@@ -1027,14 +1235,40 @@ if __name__ == "__main__":
     export_tflite(fed_swarm.agents[0], output_path="sentinel_x_model.tflite")
 
     # ------------------------------------------------------------------
-    # 4. Formal verification of the best-trained agent's policy
+    # 4. Deep-space communication delay demonstration
+    #    Train a small swarm with a 5-episode link delay to demonstrate
+    #    the effect of intermittent deep-space communication on federated
+    #    learning convergence.
+    # ------------------------------------------------------------------
+    print("\n" + "=" * 60)
+    print("Deep-space comm-delay federated learning demo (delay=5 eps)")
+    print("=" * 60)
+    delayed_swarm = FederatedSwarm(
+        num_spacecraft=SWARM_SIZE,
+        action_dim=ACTION_DIM,
+        mission_profile=MissionProfile(MissionProfile.BALANCED),
+        federated_interval=10,
+        comm_delay_steps=5,
+    )
+    delayed_rewards = []
+    for ep in range(EPISODES):
+        avg_reward = delayed_swarm.train_episode(max_steps=MAX_STEPS)
+        delayed_rewards.append(avg_reward)
+        if ep % 40 == 0:
+            print(f"  Episode {ep}: Avg Reward = {avg_reward:.2f}")
+    delayed_ops = delayed_swarm.test_episode(max_steps=200)
+    print(f"  Avg operational steps (delayed comms): {delayed_ops:.1f}")
+    all_fed_rewards["balanced+delay5"] = delayed_rewards
+
+    # ------------------------------------------------------------------
+    # 5. Formal verification of the best-trained agent's policy
     # ------------------------------------------------------------------
     print("\nRunning formal policy verification...")
     verifier = PolicyVerifier(fed_swarm.agents[0], n_samples=500)
     verifier.verify()
 
     # ------------------------------------------------------------------
-    # 5. Save training curves (basic swarm + all three fed profiles)
+    # 6. Save training curves (basic swarm + all four fed profiles + delay)
     # ------------------------------------------------------------------
     plt.figure()
     plt.plot(rewards_per_episode, label="Basic swarm")

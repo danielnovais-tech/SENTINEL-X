@@ -12,11 +12,11 @@ Deep-space systems are fragile, and rule-based recovery can't keep pace with unp
 
 - **Basic Q-learning simulation** (`sentinel_x.py`) – A tabular Q-learning agent learns to recover a simulated spacecraft from random faults (memory corruption, sensor failure, CPU hang).
 - **Advanced DQN simulation** (`sentinel_x_advanced.py`) – Extends the prototype with:
-  - **Realistic fault generators**: `MemoryArray` (single-event upsets / bit flips) and `Sensor` (Gaussian noise + stuck-at faults).
+  - **Realistic fault generators**: `MemoryArray` (single-event upsets / bit flips), `Sensor` (Gaussian noise + stuck-at), `ThermalSubsystem` (overheating / overcooling), and `PowerSubsystem` (brownout / power depletion).
   - **Deep Q-Network (DQN) agent** using TensorFlow/Keras with experience replay and a separate target network.
   - **Swarm simulation** – multiple spacecraft each managed by an independent DQN agent.
-  - **Mission-specific reward profiles** – `MissionProfile` lets you tune the reward function to mission priorities.
-  - **Federated learning** – `FederatedServer` averages DQN weights across all agents (FedAvg), aligning the swarm's policy without sharing raw data.
+  - **Mission-specific reward profiles** – `MissionProfile` lets you tune the reward function to mission priorities (balanced, data-return, lifespan, power-constrained).
+  - **Federated learning** – `FederatedServer` averages DQN weights across all agents (FedAvg), with optional deep-space communication latency simulation via `comm_delay_steps`.
   - **Multi-agent coordination** – `FederatedSwarm` cross-checks peer sensor readings to detect stuck sensors that individual agents cannot diagnose alone.
   - **TFLite export** – `export_tflite()` quantises and serialises a trained DQN for microcontroller deployment.
   - **Formal verification** – `PolicyVerifier` runs lightweight safety proofs (safety constraint, Q-value margin, action coverage) over a trained policy and prints a CI-friendly report.
@@ -47,7 +47,7 @@ Trains a tabular Q-learning agent for 500 episodes and then evaluates it against
 python sentinel_x_advanced.py
 ```
 
-Trains a basic swarm and then a `FederatedSwarm` under each of the three mission profiles, evaluates the trained agents, exports a TFLite model, and saves the training curves to `sentinel_x_training_curve.png`.
+Trains a basic swarm and then a `FederatedSwarm` under each of the four mission profiles, evaluates the trained agents, exports a TFLite model, demonstrates deep-space communication latency, and saves the training curves to `sentinel_x_training_curve.png`.
 
 ---
 
@@ -59,9 +59,11 @@ Trains a basic swarm and then a `FederatedSwarm` under each of the three mission
 ├────────────────────┬─────────────────────────────────────────┤
 │  Fault Generators  │  MemoryArray (bit flips)                 │
 │                    │  Sensor (noise / stuck-at)               │
+│                    │  ThermalSubsystem (overheating / overcooling) │
+│                    │  PowerSubsystem (brownout / depletion)   │
 ├────────────────────┼─────────────────────────────────────────┤
 │  Spacecraft        │  Aggregates subsystem health,            │
-│  Environment       │  produces normalised state vector        │
+│  Environment       │  produces 8-dim normalised state vector  │
 ├────────────────────┼─────────────────────────────────────────┤
 │  Recovery Agent    │  DQN (64→64→actions) with replay         │
 │                    │  buffer and target network               │
@@ -69,10 +71,10 @@ Trains a basic swarm and then a `FederatedSwarm` under each of the three mission
 │  Swarm             │  N independent spacecraft + agents       │
 ├────────────────────┼─────────────────────────────────────────┤
 │  FederatedSwarm    │  Swarm + peer sensor cross-check         │
-│                    │  (7-dim state) + MissionProfile          │
+│                    │  (9-dim state) + MissionProfile          │
 ├────────────────────┼─────────────────────────────────────────┤
-│  FederatedServer   │  FedAvg weight aggregation               │
-│                    │  across all DQN agents                   │
+│  FederatedServer   │  FedAvg weight aggregation with          │
+│                    │  optional deep-space comm-delay queue    │
 ├────────────────────┼─────────────────────────────────────────┤
 │  PolicyVerifier    │  Formal safety checks: constraint,       │
 │                    │  Q-margin bound, action coverage         │
@@ -81,12 +83,12 @@ Trains a basic swarm and then a `FederatedSwarm` under each of the three mission
 
 ### Recovery Actions
 
-| Action | Description                          | Effective against                  |
-|--------|--------------------------------------|------------------------------------|
-| 0      | Do nothing                           | —                                  |
-| 1      | Restart subsystem                    | Memory errors, CPU hang            |
-| 2      | Switch to redundant hardware         | All fault types (full recovery)    |
-| 3      | Safe mode                            | Stuck sensor, parity error         |
+| Action | Description                          | Effective against                              |
+|--------|--------------------------------------|------------------------------------------------|
+| 0      | Do nothing                           | —                                              |
+| 1      | Restart subsystem                    | Memory errors, sensor noise, thermal faults    |
+| 2      | Switch to redundant hardware         | All fault types (full reset, high power draw)  |
+| 3      | Safe mode (targeted)                 | Stuck sensor, parity error, thermal, brownout  |
 
 ---
 
@@ -99,6 +101,7 @@ Trains a basic swarm and then a `FederatedSwarm` under each of the three mission
 | `BALANCED` (default)     | General-purpose; equal weight on uptime and cost     |
 | `MAXIMIZE_DATA_RETURN`   | Maximise operational time; penalise inaction on faults |
 | `EXTEND_LIFESPAN`        | Prefer cheap recovery actions; preserve spares       |
+| `POWER_CONSTRAINED`      | Conserve power; penalise high-current redundant switch |
 
 ```python
 from sentinel_x_advanced import FederatedSwarm, MissionProfile
@@ -121,22 +124,31 @@ avg_reward = swarm.train_episode(max_steps=150)
 ```python
 from sentinel_x_advanced import FederatedServer, DQNAgent
 
+# Immediate aggregation (default)
 server = FederatedServer()
-agents = [DQNAgent(state_dim=7, action_dim=4) for _ in range(5)]
+agents = [DQNAgent(state_dim=9, action_dim=4) for _ in range(5)]
 # ... train agents independently for one episode each ...
 server.aggregate(agents)   # all agents now share the same averaged weights
+
+# Simulate a 5-episode deep-space link delay
+server_delayed = FederatedServer(comm_delay_steps=5)
+server_delayed.aggregate(agents)   # weights queued, not yet applied
+for _ in range(5):
+    server_delayed.tick(agents)    # advance delay counter each episode
+# weights are now applied after 5 tick() calls
 ```
 
 ---
 
 ## Multi-Agent Coordination
 
-`FederatedSwarm` extends the state vector with a **peer sensor deviation** feature (7th dimension). Before each time step, `_cross_check_sensors()` computes the deviation of each spacecraft's sensor reading from the swarm median. A spacecraft whose reading is an outlier receives a high `peer_sensor_deviation_norm` value, giving its DQN agent an additional signal to suspect a stuck-sensor fault.
+`FederatedSwarm` extends the state vector with a **peer sensor deviation** feature (9th dimension). Before each time step, `_cross_check_sensors()` computes the deviation of each spacecraft's sensor reading from the swarm median. A spacecraft whose reading is an outlier receives a high `peer_sensor_deviation_norm` value, giving its DQN agent an additional signal to suspect a stuck-sensor fault.
 
 ```
 State vector (FederatedSwarm):
   [mem_error_ratio, parity_flag, sensor_deviation_norm,
    sensor_stuck_flag, time_since_recovery_norm, health_flag,
+   thermal_fault_flag, power_level_norm,
    peer_sensor_deviation_norm]   ← coordination feature
 ```
 
@@ -149,7 +161,7 @@ Convert any trained `DQNAgent` to TensorFlow Lite for deployment on embedded har
 ```python
 from sentinel_x_advanced import export_tflite, DQNAgent
 
-agent = DQNAgent(state_dim=7, action_dim=4)
+agent = DQNAgent(state_dim=9, action_dim=4)
 # ... train agent ...
 export_tflite(agent, output_path="sentinel_x_model.tflite")
 # → TFLite model exported to 'sentinel_x_model.tflite' (8.9 KB)
@@ -172,7 +184,7 @@ The converter applies dynamic-range weight quantisation (`tf.lite.Optimize.DEFAU
 ```python
 from sentinel_x_advanced import PolicyVerifier, DQNAgent
 
-agent = DQNAgent(state_dim=7, action_dim=4)
+agent = DQNAgent(state_dim=9, action_dim=4)
 # ... train agent ...
 
 verifier = PolicyVerifier(agent, n_samples=500, margin_threshold=0.1)
