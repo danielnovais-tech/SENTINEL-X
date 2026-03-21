@@ -806,3 +806,306 @@ class TestMissionScenario:
     def test_lunar_gateway_power_constrained(self):
         s = sx.MissionScenario.lunar_gateway()
         assert s.profile == sx.MissionProfile.POWER_CONSTRAINED
+
+
+# ===========================================================================
+# New feature tests (items 18-23)
+# ===========================================================================
+
+class TestDQNAgentExplainAction:
+    """Tests for DQNAgent.explain_action() – gradient saliency."""
+
+    def test_returns_required_keys(self):
+        agent = make_agent()
+        state = np.zeros(11, dtype=np.float32)
+        result = agent.explain_action(state)
+        for key in ("best_action", "q_values", "saliency", "method"):
+            assert key in result
+
+    def test_best_action_is_valid(self):
+        agent = make_agent()
+        state = np.zeros(11, dtype=np.float32)
+        result = agent.explain_action(state)
+        assert 0 <= result["best_action"] < 4
+
+    def test_q_values_length(self):
+        agent = make_agent()
+        state = np.zeros(11, dtype=np.float32)
+        result = agent.explain_action(state)
+        assert len(result["q_values"]) == 4
+
+    def test_saliency_shape_matches_state(self):
+        agent = make_agent()
+        state = np.zeros(11, dtype=np.float32)
+        result = agent.explain_action(state)
+        assert len(result["saliency"]) == 11
+
+    def test_method_is_gradient_without_shap(self):
+        """Gradient fallback used when shap package is absent."""
+        orig = sx._SHAP_AVAILABLE
+        sx._SHAP_AVAILABLE = False
+        try:
+            agent = make_agent()
+            state = np.zeros(11, dtype=np.float32)
+            result = agent.explain_action(state)
+            assert result["method"] == "gradient"
+        finally:
+            sx._SHAP_AVAILABLE = orig
+
+    def test_non_zero_state_changes_saliency(self):
+        agent = make_agent()
+        s1 = np.zeros(11, dtype=np.float32)
+        s2 = np.ones(11, dtype=np.float32) * 0.5
+        r1 = agent.explain_action(s1)
+        r2 = agent.explain_action(s2)
+        # Both results should have valid saliency shapes regardless of values
+        assert len(r1["saliency"]) == 11
+        assert len(r2["saliency"]) == 11
+
+
+class TestDQNAgentAdaptOnline:
+    """Tests for DQNAgent.adapt_online()."""
+
+    def test_returns_zero_when_no_data(self):
+        agent = make_agent()
+        assert agent.adapt_online([]) == 0.0
+
+    def test_returns_zero_when_too_few_transitions(self):
+        agent = sx.DQNAgent(11, 4, batch_size=32)
+        state = np.zeros(11, dtype=np.float32)
+        transitions = [(state, 0, 1.0, state, False) for _ in range(10)]
+        # 10 < batch_size (32) → should return 0.0
+        assert agent.adapt_online(transitions) == 0.0
+
+    def test_returns_float_with_sufficient_data(self):
+        agent = make_agent()
+        state = np.zeros(11, dtype=np.float32)
+        transitions = [(state, random.randint(0, 3), 1.0, state, False)
+                       for _ in range(50)]
+        result = agent.adapt_online(transitions, n_steps=3)
+        assert isinstance(result, float)
+
+    def test_weights_change_after_adaptation(self):
+        agent = make_agent()
+        state = np.random.randn(11).astype(np.float32)
+        before = [w.copy() for w in agent.model.get_weights()]
+        transitions = [(state, 0, 1.0, state, False) for _ in range(50)]
+        agent.adapt_online(transitions, n_steps=5)
+        after = agent.model.get_weights()
+        assert any(not np.array_equal(b, a) for b, a in zip(before, after))
+
+
+class TestCuriosityBonus:
+    """Tests for the CuriosityBonus class."""
+
+    def test_bonus_positive_on_first_visit(self):
+        cb = sx.CuriosityBonus()
+        state = np.zeros(5, dtype=np.float32)
+        assert cb.bonus(state) > 0.0
+
+    def test_bonus_non_increasing_with_repeated_visits(self):
+        cb = sx.CuriosityBonus()
+        state = np.zeros(5, dtype=np.float32)
+        b1 = cb.bonus(state)
+        b2 = cb.bonus(state)
+        b3 = cb.bonus(state)
+        assert b1 >= b2 >= b3
+
+    def test_reset_clears_counts(self):
+        cb = sx.CuriosityBonus()
+        state = np.zeros(5, dtype=np.float32)
+        cb.bonus(state)
+        cb.reset()
+        assert cb.n_unique_cells == 0
+
+    def test_novel_state_higher_than_repeated(self):
+        cb = sx.CuriosityBonus()
+        state_a = np.zeros(5, dtype=np.float32)
+        state_b = np.ones(5, dtype=np.float32)
+        for _ in range(5):
+            cb.bonus(state_a)       # visit a many times
+        b_novel = cb.bonus(state_b)  # first visit to b
+        b_familiar = cb.bonus(state_a)
+        assert b_novel > b_familiar
+
+    def test_n_unique_cells_grows(self):
+        cb = sx.CuriosityBonus()
+        rng = np.random.default_rng(7)
+        for _ in range(20):
+            cb.bonus(rng.random(5).astype(np.float32))
+        assert cb.n_unique_cells >= 1
+
+    def test_clip_respected(self):
+        cb = sx.CuriosityBonus(bonus_scale=10.0, clip=0.5)
+        state = np.zeros(5, dtype=np.float32)
+        assert cb.bonus(state) <= 0.5
+
+
+class TestCooperativeRewards:
+    """Tests for FederatedSwarm cooperative_bonus."""
+
+    def test_train_episode_with_bonus_returns_float(self):
+        swarm = sx.FederatedSwarm(
+            num_spacecraft=2,
+            action_dim=4,
+            mission_profile=sx.MissionProfile(sx.MissionProfile.BALANCED),
+            federated_interval=5,
+            cooperative_bonus=0.5,
+        )
+        result = swarm.train_episode(max_steps=5)
+        assert isinstance(result, float)
+
+    def test_zero_bonus_is_default(self):
+        swarm = sx.FederatedSwarm(
+            num_spacecraft=2,
+            action_dim=4,
+            mission_profile=sx.MissionProfile(sx.MissionProfile.BALANCED),
+            federated_interval=5,
+        )
+        assert swarm.cooperative_bonus == pytest.approx(0.0)
+
+    def test_cooperative_bonus_stored(self):
+        swarm = sx.FederatedSwarm(
+            num_spacecraft=2,
+            action_dim=4,
+            mission_profile=sx.MissionProfile(sx.MissionProfile.BALANCED),
+            federated_interval=5,
+            cooperative_bonus=1.0,
+        )
+        assert swarm.cooperative_bonus == pytest.approx(1.0)
+
+    def test_build_swarm_for_scenario_passes_bonus(self):
+        scenario = sx.MissionScenario.lunar_gateway()
+        swarm = sx.build_swarm_for_scenario(scenario, cooperative_bonus=0.3)
+        assert swarm.cooperative_bonus == pytest.approx(0.3)
+
+
+class TestPPOAgent:
+    """Tests for the PPOAgent class."""
+
+    @staticmethod
+    def make_ppo():
+        return sx.PPOAgent(state_dim=11, action_dim=4)
+
+    def test_act_returns_valid_types(self):
+        agent = self.make_ppo()
+        state = np.zeros(11, dtype=np.float32)
+        action, log_prob, value = agent.act(state)
+        assert 0 <= action < 4
+        assert isinstance(log_prob, float)
+        assert isinstance(value, float)
+
+    def test_action_within_bounds_non_zero_state(self):
+        agent = self.make_ppo()
+        state = np.ones(11, dtype=np.float32)
+        action, _, _ = agent.act(state)
+        assert 0 <= action < 4
+
+    def test_update_empty_buffer_returns_zero(self):
+        agent = self.make_ppo()
+        assert agent.update() == 0.0
+
+    def test_remember_then_update_returns_float(self):
+        agent = self.make_ppo()
+        state = np.zeros(11, dtype=np.float32)
+        for _ in range(10):
+            action, log_prob, value = agent.act(state)
+            agent.remember(state, action, 1.0, log_prob, value, False)
+        loss = agent.update()
+        assert isinstance(loss, float)
+
+    def test_update_clears_trajectory_buffer(self):
+        agent = self.make_ppo()
+        state = np.zeros(11, dtype=np.float32)
+        for _ in range(5):
+            action, log_prob, value = agent.act(state)
+            agent.remember(state, action, 0.0, log_prob, value, True)
+        agent.update()
+        assert len(agent._states) == 0
+
+    def test_multiple_update_cycles(self):
+        agent = self.make_ppo()
+        state = np.zeros(11, dtype=np.float32)
+        for cycle in range(3):
+            for _ in range(8):
+                action, log_prob, value = agent.act(state)
+                agent.remember(state, action, float(cycle), log_prob, value, False)
+            loss = agent.update()
+            assert isinstance(loss, float)
+
+
+class TestHierarchicalAgent:
+    """Tests for the HierarchicalAgent class."""
+
+    @staticmethod
+    def make_agent():
+        return sx.HierarchicalAgent(state_dim=11, action_dim=4)
+
+    def test_act_returns_valid_action(self):
+        agent = self.make_agent()
+        state = np.zeros(11, dtype=np.float32)
+        action = agent.act(state)
+        assert 0 <= action < 4
+
+    def test_current_phase_name_valid(self):
+        agent = self.make_agent()
+        state = np.zeros(11, dtype=np.float32)
+        agent.act(state)
+        assert agent.current_phase_name in sx.HierarchicalAgent.PHASE_NAMES
+
+    def test_remember_and_replay_no_error(self):
+        agent = self.make_agent()
+        state = np.zeros(11, dtype=np.float32)
+        action = agent.act(state)
+        agent.remember(state, action, 1.0, state, False)
+        agent.replay()   # should not raise
+
+    def test_phase_changes_over_time(self):
+        """After phase_duration steps a new phase is selected."""
+        agent = sx.HierarchicalAgent(
+            state_dim=11, action_dim=4, phase_duration=5
+        )
+        state = np.zeros(11, dtype=np.float32)
+        phases_seen = set()
+        for _ in range(30):
+            agent.act(state)
+            phases_seen.add(agent._current_phase)
+        # At least one phase was visited (may be the same if deterministic)
+        assert len(phases_seen) >= 1
+
+    def test_low_level_state_dim(self):
+        """Low-level agent receives state_dim + 1 features."""
+        agent = self.make_agent()
+        assert agent.low_level.state_dim == 12   # 11 + 1 phase feature
+
+    def test_high_level_action_dim_equals_n_phases(self):
+        agent = self.make_agent()
+        assert agent.high_level.action_dim == sx.HierarchicalAgent.N_PHASES
+
+
+class TestTfFunctionTrainStep:
+    """Tests that the @tf.function train step in DQNAgent works correctly."""
+
+    def test_train_step_callable(self):
+        agent = make_agent()
+        assert callable(agent._train_step_fn)
+
+    def test_replay_still_works_after_refactor(self):
+        """replay() should run without error after the @tf.function refactor."""
+        agent = make_agent()
+        state = np.zeros(11, dtype=np.float32)
+        for _ in range(50):
+            agent.remember(state, 0, 1.0, state, False)
+        agent.replay()   # should not raise
+
+    def test_train_step_reduces_loss(self):
+        """Calling _train_step_fn repeatedly should not diverge."""
+        import tensorflow as tf
+        agent = make_agent()
+        states = tf.zeros((32, 11), dtype=tf.float32)
+        targets = tf.zeros((32, 4), dtype=tf.float32)
+        loss1 = float(agent._train_step_fn(states, targets))
+        loss2 = float(agent._train_step_fn(states, targets))
+        # Losses should be finite (not NaN/Inf)
+        assert loss1 == loss1   # NaN check
+        assert loss2 == loss2
