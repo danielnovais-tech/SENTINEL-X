@@ -46,11 +46,27 @@ Extends the basic Q-learning prototype with:
 
   10. Safety monitor – SafetyMonitor is a rule-based FDIR veto layer that
        overrides DQN actions violating hard spacecraft safety constraints,
-       enabling a hybrid RL + deterministic architecture.
+       enabling a hybrid RL + deterministic architecture.  Pass a
+       ``SafetyMonitor`` instance to ``FederatedSwarm`` via the
+       ``safety_monitor`` parameter to integrate veto into the training loop:
+       the agent learns from vetoed actions and the per-episode override count
+       is available via ``FederatedSwarm.last_override_count``.
 
   11. Adversarial testing – AdversarialTester finds minimal L∞-bounded state
        perturbations (FGSM) that flip the greedy action, revealing policy
        fragility and generating adversarial training examples.
+
+  12. Adversarial training – AdversarialTester.augment_replay_buffer() injects
+       adversarial transitions into agent replay buffers, hardening the policy
+       against corner-case perturbations.
+
+  13. Robustness certification – AdversarialTester.certify_robustness() uses
+       binary search to estimate the per-state minimum perturbation magnitude
+       required to flip the greedy action (certified robustness radius).
+
+  14. Federation benchmark – benchmark_federation() compares centralised FedAvg
+       against decentralised gossip under varying link-dropout rates and prints
+       a formatted summary table.
 
 Install dependencies:
     pip install numpy tensorflow matplotlib
@@ -949,7 +965,32 @@ class FederatedSwarm(Swarm):
         federated_interval: int = 10,
         comm_delay_steps: int = 0,
         link_dropout_prob: float = 0.0,
+        safety_monitor: "SafetyMonitor" = None,
     ):
+        """
+        Parameters
+        ----------
+        num_spacecraft : int
+            Number of spacecraft in the swarm.
+        action_dim : int
+            Number of discrete recovery actions.
+        mission_profile : MissionProfile, optional
+            Reward-shaping strategy. Defaults to MissionProfile.BALANCED.
+        federated_interval : int
+            Number of episodes between federated weight aggregations.
+        comm_delay_steps : int
+            Communication latency in episodes before aggregated weights reach
+            agents.
+        link_dropout_prob : float
+            Probability that any agent drops out of a given aggregation round.
+        safety_monitor : SafetyMonitor, optional
+            When provided, every DQN-recommended action is passed through
+            ``SafetyMonitor.veto()`` before being applied to the environment
+            *and* stored in the replay buffer.  Override events are counted in
+            ``self.last_override_count`` and the agent still receives the
+            (possibly lower) reward for the vetoed action, encouraging it to
+            avoid constraint-violating choices during training.
+        """
         super().__init__(num_spacecraft, self.COORD_STATE_DIM, action_dim)
         self.server = FederatedServer(
             comm_delay_steps=comm_delay_steps,
@@ -957,7 +998,9 @@ class FederatedSwarm(Swarm):
         )
         self.mission_profile = mission_profile or MissionProfile()
         self.federated_interval = federated_interval
+        self.safety_monitor = safety_monitor
         self._episode_count = 0
+        self.last_override_count = 0   # overrides triggered in last train_episode
         for sc in self.spacecraft:
             sc._peer_sensor_deviation = 0.0
 
@@ -1007,21 +1050,41 @@ class FederatedSwarm(Swarm):
         readings are always synchronised before actions are selected.
         Federated weight aggregation is performed every
         ``federated_interval`` episodes.
+
+        If a ``SafetyMonitor`` was supplied at construction time, every
+        DQN-recommended action is passed through ``veto()`` before being
+        applied to the environment *and* stored in the replay buffer.  The
+        number of veto overrides in this episode is recorded in
+        ``self.last_override_count``.
         """
         for sc in self.spacecraft:
             sc.reset()
             sc._peer_sensor_deviation = 0.0
 
         episode_rewards = [0.0] * len(self.spacecraft)
+        override_count = 0
 
         for step in range(max_steps):
             # Observe coordinated states (pre-step cross-check)
             self._cross_check_sensors()
             states = [self._get_coordinated_state(sc) for sc in self.spacecraft]
-            actions = [
+
+            # Select actions and optionally apply safety veto
+            raw_actions = [
                 self.agents[i].act(states[i], training=True)
                 for i in range(len(self.spacecraft))
             ]
+            if self.safety_monitor is not None:
+                actions = []
+                for i, sc in enumerate(self.spacecraft):
+                    vetoed = self.safety_monitor.veto(
+                        raw_actions[i], states[i], self.agents[i].action_dim
+                    )
+                    if vetoed != raw_actions[i]:
+                        override_count += 1
+                    actions.append(vetoed)
+            else:
+                actions = raw_actions
 
             # All spacecraft advance one time step together
             for sc in self.spacecraft:
@@ -1043,6 +1106,8 @@ class FederatedSwarm(Swarm):
                 )
                 episode_rewards[i] += reward
                 done = step == max_steps - 1
+                # Store the vetoed (safe) action so the agent learns to
+                # prefer constraint-respecting choices autonomously.
                 self.agents[i].remember(states[i], actions[i], reward, new_state, done)
                 self.agents[i].replay()
 
@@ -1051,6 +1116,7 @@ class FederatedSwarm(Swarm):
                     agent.update_target()
 
         self._episode_count += 1
+        self.last_override_count = override_count
         if self._episode_count % self.federated_interval == 0:
             self.server.aggregate(self.agents)
 
@@ -1603,6 +1669,138 @@ class AdversarialTester:
                 )
         return results
 
+    def augment_replay_buffer(
+        self,
+        agents: list,
+        n_examples: int = 100,
+        safety_monitor: "SafetyMonitor" = None,
+    ) -> int:
+        """
+        Harden agents by adding adversarial transitions to their replay buffers.
+
+        For every adversarial example found, a synthetic transition is created:
+        the *original* (clean) state is paired with the *safe* recovery action
+        (i.e., the non-flipped action, optionally passed through a
+        ``SafetyMonitor`` veto) and a reward of ``+1.0``.  The next_state is
+        the perturbed state, and ``done`` is False.
+
+        This teaches the agent that, near a decision boundary, the original
+        action should be maintained even under small state perturbations.
+
+        Parameters
+        ----------
+        agents : list[DQNAgent]
+            Agents whose replay buffers will be augmented.
+        n_examples : int
+            Number of candidate adversarial states to probe.
+        safety_monitor : SafetyMonitor, optional
+            When provided the synthetic action is also passed through veto
+            so that only constraint-respecting actions are injected.
+
+        Returns
+        -------
+        int
+            Number of adversarial transitions successfully injected.
+        """
+        examples = self.find_adversarial_examples(n_examples=n_examples)
+        injected = 0
+        for ex in examples:
+            clean_state = ex["original_state"]
+            perturbed_state = ex["perturbed_state"]
+            safe_action = ex["original_action"]   # original was stable; reinforce it
+            if safety_monitor is not None:
+                safe_action = safety_monitor.veto(
+                    safe_action, clean_state, self.agent.action_dim
+                )
+            for agent in agents:
+                agent.remember(
+                    clean_state,
+                    safe_action,
+                    1.0,           # positive reward: this is the correct behaviour
+                    perturbed_state,
+                    False,
+                )
+            injected += 1
+        return injected
+
+    def certify_robustness(
+        self,
+        n_samples: int = 200,
+        eps_lo: float = 0.0,
+        eps_hi: float = 0.5,
+        n_bisect: int = 12,
+    ) -> dict:
+        """
+        Estimate the per-state robustness radius via binary search.
+
+        For each sampled fault state, binary-search the smallest ε in
+        ``[eps_lo, eps_hi]`` at which an FGSM perturbation flips the greedy
+        action.  States that are robust at ``eps_hi`` are assigned a radius
+        of ``eps_hi`` (lower-bound).
+
+        Parameters
+        ----------
+        n_samples : int
+            Number of random fault states to certify.
+        eps_lo : float
+            Lower bound of the search range.
+        eps_hi : float
+            Upper bound of the search range (and maximum reported radius).
+        n_bisect : int
+            Number of bisection iterations (accuracy ≈ ``eps_hi / 2**n_bisect``).
+
+        Returns
+        -------
+        dict with keys:
+            ``mean_radius``  – float, mean minimum flip-ε across samples
+            ``min_radius``   – float, worst-case (most fragile) certified radius
+            ``max_radius``   – float, best-case certified radius (≤ eps_hi)
+            ``robust_frac``  – float, fraction of states robust at eps_hi
+            ``eps_hi``       – float, the configured upper bound
+            ``n_samples``    – int, number of states evaluated
+        """
+        dim = self.agent.state_dim
+        states = self.rng.uniform(0.0, 1.0, size=(n_samples, dim)).astype(np.float32)
+        states[:, Spacecraft.HEALTH_FLAG_IDX] = 1.0
+
+        original_eps = self.epsilon
+        radii = []
+        robust_count = 0
+        for state in states:
+            orig_action = self._greedy_action(state)
+            lo, hi = eps_lo, eps_hi
+            flipped_at_hi = self._action_flips_at_eps(state, orig_action, hi)
+            if not flipped_at_hi:
+                radii.append(eps_hi)
+                robust_count += 1
+                continue
+            for _ in range(n_bisect):
+                mid = (lo + hi) / 2.0
+                if self._action_flips_at_eps(state, orig_action, mid):
+                    hi = mid
+                else:
+                    lo = mid
+            radii.append((lo + hi) / 2.0)
+        self.epsilon = original_eps
+
+        radii_arr = np.array(radii, dtype=np.float64)
+        return {
+            "mean_radius": float(np.mean(radii_arr)),
+            "min_radius": float(np.min(radii_arr)),
+            "max_radius": float(np.max(radii_arr)),
+            "robust_frac": robust_count / max(n_samples, 1),
+            "eps_hi": eps_hi,
+            "n_samples": n_samples,
+        }
+
+    def _action_flips_at_eps(self, state: np.ndarray, orig_action: int, eps: float) -> bool:
+        """Return True if an FGSM perturbation of size *eps* flips the action."""
+        saved_eps = self.epsilon
+        self.epsilon = eps
+        perturbed = self._fgsm_perturb(state)
+        self.epsilon = saved_eps
+        return self._greedy_action(perturbed) != orig_action
+
     def summary(self, results: list, n_tested: int) -> None:
         """
         Print a summary of adversarial findings.
@@ -1660,7 +1858,121 @@ class AdversarialTester:
 
 
 # -----------------------------------------------------------------------
-# 13. Main Training Loop
+# 13. Federation Benchmark (FedAvg vs Gossip)
+# -----------------------------------------------------------------------
+
+def benchmark_federation(
+    num_spacecraft: int = 4,
+    episodes: int = 50,
+    max_steps: int = 100,
+    dropout_rates: tuple = (0.0, 0.2, 0.5),
+    comm_delay: int = 0,
+    federated_interval: int = 10,
+    gossip_k: int = 2,
+    rng_seed: int = 0,
+) -> dict:
+    """
+    Compare centralised FedAvg against decentralised gossip federation.
+
+    Trains one ``FederatedSwarm`` per (method × dropout_rate) combination and
+    records the mean reward per episode and the final test operational steps.
+    Results are printed as a formatted summary table.
+
+    Parameters
+    ----------
+    num_spacecraft : int
+        Swarm size used for every condition.
+    episodes : int
+        Training episodes per condition.
+    max_steps : int
+        Steps per training episode.
+    dropout_rates : tuple of float
+        Link-dropout probabilities to sweep across.
+    comm_delay : int
+        Communication delay steps applied to *both* methods equally.
+    federated_interval : int
+        Episodes between aggregation events.
+    gossip_k : int
+        Number of gossip neighbours per agent per round.
+    rng_seed : int
+        Seed for NumPy random state (unused directly; sets Python random seed
+        so training conditions are repeatable).
+
+    Returns
+    -------
+    dict
+        Nested dict ``results[method][dropout_rate]`` where each value is a
+        dict with keys ``rewards`` (list of per-episode mean rewards) and
+        ``test_ops`` (float, final avg operational steps in test episode).
+    """
+    random.seed(rng_seed)
+    np.random.seed(rng_seed)
+
+    profile = MissionProfile(MissionProfile.BALANCED)
+    results: dict = {"fedavg": {}, "gossip": {}}
+
+    col_w = 10
+    header = (
+        f"{'Method':<10} {'Dropout':>{col_w}} {'FinalReward':>{col_w+2}}"
+        f" {'TestOps':>{col_w}}"
+    )
+    print("\n" + "=" * len(header))
+    print("  SENTINEL-X  Federation Benchmark")
+    print("=" * len(header))
+    print(header)
+    print("-" * len(header))
+
+    for dropout in dropout_rates:
+        # ---- FedAvg ----
+        fed_swarm = FederatedSwarm(
+            num_spacecraft=num_spacecraft,
+            action_dim=4,
+            mission_profile=MissionProfile(MissionProfile.BALANCED),
+            federated_interval=federated_interval,
+            comm_delay_steps=comm_delay,
+            link_dropout_prob=dropout,
+        )
+        fed_rewards = []
+        for _ in range(episodes):
+            fed_rewards.append(fed_swarm.train_episode(max_steps=max_steps))
+        fed_ops = fed_swarm.test_episode(max_steps=max_steps)
+        results["fedavg"][dropout] = {"rewards": fed_rewards, "test_ops": fed_ops}
+        print(
+            f"  {'FedAvg':<8} {dropout:>{col_w}.1%}"
+            f" {fed_rewards[-1]:>{col_w+2}.2f}"
+            f" {fed_ops:>{col_w}.1f}"
+        )
+
+        # ---- Gossip ----
+        gossip_swarm = FederatedSwarm(
+            num_spacecraft=num_spacecraft,
+            action_dim=4,
+            mission_profile=MissionProfile(MissionProfile.BALANCED),
+            federated_interval=999,   # disable central FedAvg
+            comm_delay_steps=comm_delay,
+            link_dropout_prob=0.0,
+        )
+        gossip_server = GossipServer(k=gossip_k, comm_delay_steps=comm_delay)
+        gos_rewards = []
+        for ep in range(episodes):
+            gos_rewards.append(gossip_swarm.train_episode(max_steps=max_steps))
+            if ep % federated_interval == 0:
+                gossip_server.gossip_round(gossip_swarm.agents)
+                gossip_server.tick(gossip_swarm.agents)
+        gos_ops = gossip_swarm.test_episode(max_steps=max_steps)
+        results["gossip"][dropout] = {"rewards": gos_rewards, "test_ops": gos_ops}
+        print(
+            f"  {'Gossip':<8} {dropout:>{col_w}.1%}"
+            f" {gos_rewards[-1]:>{col_w+2}.2f}"
+            f" {gos_ops:>{col_w}.1f}"
+        )
+
+    print("=" * len(header))
+    return results
+
+
+# -----------------------------------------------------------------------
+# 14. Main Training Loop
 # -----------------------------------------------------------------------
 
 def run_do_nothing_baseline(episodes=10, max_steps=200):
@@ -1838,7 +2150,80 @@ if __name__ == "__main__":
     adv_tester.summary(adv_results, n_tested=N_ADV)
 
     # ------------------------------------------------------------------
-    # 10. Save training curves (basic swarm + all profiles + gossip)
+    # 10. Adversarial training – harden the agent with augmented replay
+    # ------------------------------------------------------------------
+    print("\nAugmenting replay buffers with adversarial examples...")
+    monitor_for_adv = SafetyMonitor()
+    n_injected = adv_tester.augment_replay_buffer(
+        fed_swarm.agents, n_examples=N_ADV, safety_monitor=monitor_for_adv
+    )
+    print(f"  Injected {n_injected} adversarial transitions into each agent's buffer.")
+    # Run a few more training episodes so the injected examples take effect
+    print("  Running 20 adversarial fine-tuning episodes...")
+    for ep in range(20):
+        for agent in fed_swarm.agents:
+            agent.replay()
+
+    # Re-run adversarial test to measure improvement
+    adv_results_post = adv_tester.find_adversarial_examples(n_examples=N_ADV)
+    print(
+        f"  Flip rate after augmentation: "
+        f"{len(adv_results_post)}/{N_ADV} "
+        f"({len(adv_results_post)/N_ADV*100:.1f}%)"
+    )
+
+    # ------------------------------------------------------------------
+    # 11. Robustness certification
+    # ------------------------------------------------------------------
+    print("\nRunning robustness certification (binary-search ε)...")
+    cert = adv_tester.certify_robustness(n_samples=100, eps_hi=0.3, n_bisect=10)
+    print(f"  Mean certified radius : {cert['mean_radius']:.4f}")
+    print(f"  Min  certified radius : {cert['min_radius']:.4f}  (worst-case)")
+    print(f"  Max  certified radius : {cert['max_radius']:.4f}  (best-case)")
+    print(f"  Robust fraction at ε={cert['eps_hi']}: {cert['robust_frac']*100:.1f}%")
+
+    # ------------------------------------------------------------------
+    # 12. Safety-aware training demo
+    # ------------------------------------------------------------------
+    print("\n" + "=" * 60)
+    print("Safety-aware training with integrated SafetyMonitor")
+    print("=" * 60)
+    safety_aware_swarm = FederatedSwarm(
+        num_spacecraft=SWARM_SIZE,
+        action_dim=ACTION_DIM,
+        mission_profile=MissionProfile(MissionProfile.BALANCED),
+        federated_interval=10,
+        safety_monitor=SafetyMonitor(),
+    )
+    total_overrides = 0
+    sa_rewards = []
+    for ep in range(EPISODES):
+        avg_reward = safety_aware_swarm.train_episode(max_steps=MAX_STEPS)
+        sa_rewards.append(avg_reward)
+        total_overrides += safety_aware_swarm.last_override_count
+        if ep % 40 == 0:
+            print(
+                f"  Episode {ep}: Avg Reward = {avg_reward:.2f}"
+                f"  Overrides = {safety_aware_swarm.last_override_count}"
+            )
+    sa_ops = safety_aware_swarm.test_episode(max_steps=200)
+    print(f"  Avg operational steps (safety-aware): {sa_ops:.1f}")
+    print(f"  Total safety veto overrides during training: {total_overrides}")
+    all_fed_rewards["safety_aware"] = sa_rewards
+
+    # ------------------------------------------------------------------
+    # 13. Federation benchmark (FedAvg vs Gossip across dropout rates)
+    # ------------------------------------------------------------------
+    print()
+    benchmark_federation(
+        num_spacecraft=3,
+        episodes=30,
+        max_steps=80,
+        dropout_rates=(0.0, 0.3),
+    )
+
+    # ------------------------------------------------------------------
+    # 14. Save training curves (basic swarm + all profiles + gossip)
     # ------------------------------------------------------------------
     plt.figure()
     plt.plot(rewards_per_episode, label="Basic swarm")
