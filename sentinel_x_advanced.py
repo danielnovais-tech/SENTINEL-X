@@ -1,6 +1,6 @@
 """
-SENTINEL-X Advanced: Realistic Faults, Deep Q-Network, and Swarm Simulation
-============================================================================
+SENTINEL-X Advanced: Realistic Faults, DQN, Swarm, Federated Learning & Coordination
+======================================================================================
 Extends the basic Q-learning prototype with:
 
   1. Realistic fault generators:
@@ -13,6 +13,18 @@ Extends the basic Q-learning prototype with:
        - Epsilon-greedy exploration with decay
 
   3. Swarm simulation – N spacecraft each managed by an independent DQN agent.
+
+  4. Mission-specific reward profiles – tailor optimisation to mission priorities
+       (balanced / maximise data return / extend lifespan).
+
+  5. Federated learning – a central FederatedServer averages DQN weights across
+       all agents (FedAvg) at configurable intervals.
+
+  6. Multi-agent coordination – spacecraft cross-check peer sensor readings to
+       detect stuck sensors that an individual agent cannot diagnose alone.
+
+  7. TFLite export – convert a trained DQN to TensorFlow Lite for deployment on
+       microcontrollers and embedded hardware.
 
 Install dependencies:
     pip install numpy tensorflow matplotlib
@@ -200,13 +212,21 @@ class Spacecraft:
     """
     Spacecraft combining a MemoryArray and a Sensor subsystem.
 
-    State vector (6 features, all normalised to [0, 1]):
+    Base state vector (6 features, all normalised to [0, 1]):
         [mem_error_ratio, parity_flag, sensor_deviation_norm,
          sensor_stuck_flag, time_since_recovery_norm, health_flag]
+
+    Note: FederatedSwarm extends this to a 7-feature vector by appending a
+    peer_sensor_deviation_norm coordination feature via
+    ``_get_coordinated_state()``.
     """
 
     def __init__(self, spacecraft_id=0):
         self.id = spacecraft_id
+        self._reset_state()
+
+    def _reset_state(self):
+        """Initialise (or re-initialise) all mutable state for a new episode."""
         self.memory = MemoryArray(size_bits=1024, flip_rate_per_bit=1e-4)
         self.sensor = Sensor(true_value=25.0, noise_std=0.5, stuck_prob=0.01)
         self.healthy = True
@@ -303,7 +323,7 @@ class Spacecraft:
 
     def reset(self):
         """Re-initialise the spacecraft for a new episode."""
-        self.__init__(spacecraft_id=self.id)
+        self._reset_state()
 
 
 # -----------------------------------------------------------------------
@@ -386,7 +406,321 @@ class Swarm:
 
 
 # -----------------------------------------------------------------------
-# 5. Main Training Loop
+# 5. Mission-Specific Reward Profiles
+# -----------------------------------------------------------------------
+
+class MissionProfile:
+    """
+    Encapsulates reward shaping based on mission objectives.
+
+    Three built-in profiles are provided:
+
+    * **BALANCED** (default)
+        General-purpose recovery. Equal weight on uptime and recovery cost.
+
+    * **MAXIMIZE_DATA_RETURN**
+        Prioritise operational time; penalise inaction during faults and
+        incentivise fast recovery regardless of resource cost.
+
+    * **EXTEND_LIFESPAN**
+        Preserve redundant hardware. Prefer cheap recovery actions (restart,
+        safe mode) and accept brief downtime to avoid wearing out spares.
+    """
+
+    BALANCED = "balanced"
+    MAXIMIZE_DATA_RETURN = "data_return"
+    EXTEND_LIFESPAN = "lifespan"
+
+    def __init__(self, profile: str = BALANCED):
+        if profile not in (self.BALANCED, self.MAXIMIZE_DATA_RETURN, self.EXTEND_LIFESPAN):
+            raise ValueError(
+                f"Unknown profile '{profile}'. Choose from: "
+                f"{self.BALANCED}, {self.MAXIMIZE_DATA_RETURN}, {self.EXTEND_LIFESPAN}"
+            )
+        self.profile = profile
+
+    def compute(self, was_healthy: bool, now_operational: bool, action: int) -> float:
+        """
+        Return a scalar reward.
+
+        Parameters
+        ----------
+        was_healthy : bool
+            Spacecraft health *before* the recovery action was applied.
+        now_operational : bool
+            Spacecraft health *after* the recovery action.
+        action : int
+            Recovery action (0 = do nothing, 1 = restart,
+            2 = switch to redundant, 3 = safe mode).
+        """
+        if self.profile == self.MAXIMIZE_DATA_RETURN:
+            # High reward for being up; penalise lingering faults and inaction.
+            reward = 2.0 if now_operational else -2.0
+            if not was_healthy and now_operational:
+                reward += 8.0        # fast recovery greatly rewarded
+            elif not now_operational and not was_healthy:
+                if action == 0:
+                    reward -= 1.0    # penalise doing nothing when faulty
+                else:
+                    reward -= 3.0    # failed recovery attempt
+            return reward
+
+        elif self.profile == self.EXTEND_LIFESPAN:
+            # Balanced uptime; steer agent toward cheap recovery actions.
+            reward = 1.0 if now_operational else -1.0
+            if not was_healthy and now_operational:
+                reward += 5.0
+                if action in (1, 3):   # restart or safe mode – cheap
+                    reward += 1.0
+                elif action == 2:       # redundant switch – expensive
+                    reward -= 1.0
+            elif action != 0 and not now_operational:
+                reward -= 2.0
+            return reward
+
+        else:  # BALANCED (default)
+            reward = 1.0 if now_operational else -1.0
+            if action != 0 and now_operational and not was_healthy:
+                reward += 5.0
+            elif action != 0 and not now_operational:
+                reward -= 2.0
+            return reward
+
+
+# -----------------------------------------------------------------------
+# 6. Federated Learning Server
+# -----------------------------------------------------------------------
+
+class FederatedServer:
+    """
+    Central server that aggregates DQN weights across a swarm (FedAvg).
+
+    After aggregation every agent receives the same globally averaged
+    weights, promoting convergence while still allowing each agent to
+    continue learning from its own local experience.
+    """
+
+    def aggregate(self, agents: list) -> None:
+        """
+        Average online-network weights across all agents and redistribute.
+
+        The target network of each agent is also synchronised so that the
+        next round of local training starts from a consistent baseline.
+
+        Parameters
+        ----------
+        agents : list[DQNAgent]
+            All agents participating in this aggregation round.
+        """
+        if not agents:
+            return
+        all_weights = [agent.model.get_weights() for agent in agents]
+        n_layers = len(all_weights[0])
+        avg_weights = [
+            np.mean([all_weights[a][layer] for a in range(len(agents))], axis=0)
+            for layer in range(n_layers)
+        ]
+        for agent in agents:
+            agent.model.set_weights(avg_weights)
+            agent.update_target()
+
+
+# -----------------------------------------------------------------------
+# 7. Federated Swarm with Multi-Agent Coordination
+# -----------------------------------------------------------------------
+
+class FederatedSwarm(Swarm):
+    """
+    Extends Swarm with federated learning, sensor cross-checking, and
+    mission-profile reward shaping.
+
+    The state vector is extended to 7 features:
+
+        [mem_error_ratio, parity_flag, sensor_deviation_norm,
+         sensor_stuck_flag, time_since_recovery_norm, health_flag,
+         peer_sensor_deviation_norm]   ← coordination feature
+
+    Parameters
+    ----------
+    num_spacecraft : int
+        Number of spacecraft in the swarm.
+    action_dim : int
+        Number of discrete recovery actions.
+    mission_profile : MissionProfile, optional
+        Reward-shaping strategy. Defaults to MissionProfile.BALANCED.
+    federated_interval : int
+        Number of episodes between federated weight aggregations.
+    """
+
+    COORD_STATE_DIM = 7   # base 6 features + 1 peer-sensor deviation feature
+
+    def __init__(
+        self,
+        num_spacecraft: int,
+        action_dim: int,
+        mission_profile: MissionProfile = None,
+        federated_interval: int = 10,
+    ):
+        super().__init__(num_spacecraft, self.COORD_STATE_DIM, action_dim)
+        self.server = FederatedServer()
+        self.mission_profile = mission_profile or MissionProfile()
+        self.federated_interval = federated_interval
+        self._episode_count = 0
+        for sc in self.spacecraft:
+            sc._peer_sensor_deviation = 0.0
+
+    # ------------------------------------------------------------------
+    # Internal helpers
+    # ------------------------------------------------------------------
+
+    def _cross_check_sensors(self) -> None:
+        """
+        Compute each spacecraft's sensor deviation from the swarm median.
+
+        A spacecraft whose reading is an outlier among its peers is likely
+        experiencing a stuck-sensor fault, even if it cannot detect this
+        from its own readings alone.  The per-spacecraft
+        ``_peer_sensor_deviation`` attribute becomes the 7th state feature
+        fed to the DQN, enabling coordinated fault diagnosis.
+        """
+        readings = np.array(
+            [sc.sensor_reading for sc in self.spacecraft], dtype=np.float32
+        )
+        if len(readings) < 2:
+            for sc in self.spacecraft:
+                sc._peer_sensor_deviation = 0.0
+            return
+        median = float(np.median(readings))
+        for sc in self.spacecraft:
+            dev = abs(sc.sensor_reading - median)
+            sc._peer_sensor_deviation = float(
+                min(dev / sc.max_sensor_deviation, 1.0)
+            )
+
+    def _get_coordinated_state(self, sc: Spacecraft) -> np.ndarray:
+        """Return the 7-feature state vector for *sc*, including peer deviation."""
+        base = sc.get_state()                                          # shape (6,)
+        peer = np.float32(getattr(sc, "_peer_sensor_deviation", 0.0))
+        return np.append(base, peer)
+
+    # ------------------------------------------------------------------
+    # Training / testing overrides
+    # ------------------------------------------------------------------
+
+    def train_episode(self, max_steps: int = 200) -> float:
+        """
+        Run one training episode for the federated swarm.
+
+        All spacecraft step simultaneously each tick so that cross-sensor
+        readings are always synchronised before actions are selected.
+        Federated weight aggregation is performed every
+        ``federated_interval`` episodes.
+        """
+        for sc in self.spacecraft:
+            sc.reset()
+            sc._peer_sensor_deviation = 0.0
+
+        episode_rewards = [0.0] * len(self.spacecraft)
+
+        for step in range(max_steps):
+            # Observe coordinated states (pre-step cross-check)
+            self._cross_check_sensors()
+            states = [self._get_coordinated_state(sc) for sc in self.spacecraft]
+            actions = [
+                self.agents[i].act(states[i], training=True)
+                for i in range(len(self.spacecraft))
+            ]
+
+            # All spacecraft advance one time step together
+            for sc in self.spacecraft:
+                sc.step()
+
+            # Cross-check after step; apply recovery actions
+            self._cross_check_sensors()
+            was_healthy = [sc.is_operational() for sc in self.spacecraft]
+            for i, sc in enumerate(self.spacecraft):
+                if not sc.is_operational():
+                    sc.apply_recovery(actions[i])
+
+            # Observe new states and compute mission-shaped rewards
+            for i, sc in enumerate(self.spacecraft):
+                new_state = self._get_coordinated_state(sc)
+                now_operational = sc.is_operational()
+                reward = self.mission_profile.compute(
+                    was_healthy[i], now_operational, actions[i]
+                )
+                episode_rewards[i] += reward
+                done = step == max_steps - 1
+                self.agents[i].remember(states[i], actions[i], reward, new_state, done)
+                self.agents[i].replay()
+
+            if step % 10 == 0:
+                for agent in self.agents:
+                    agent.update_target()
+
+        self._episode_count += 1
+        if self._episode_count % self.federated_interval == 0:
+            self.server.aggregate(self.agents)
+
+        return float(np.mean(episode_rewards))
+
+    def test_episode(self, max_steps: int = 200) -> float:
+        """Evaluate the swarm (no exploration); returns avg operational steps."""
+        for sc in self.spacecraft:
+            sc.reset()
+            sc._peer_sensor_deviation = 0.0
+
+        total_operational = 0
+        for _ in range(max_steps):
+            self._cross_check_sensors()
+            for i, sc in enumerate(self.spacecraft):
+                state = self._get_coordinated_state(sc)
+                action = self.agents[i].act(state, training=False)
+                sc.step()
+                if not sc.is_operational():
+                    sc.apply_recovery(action)
+                if sc.is_operational():
+                    total_operational += 1
+
+        return total_operational / len(self.spacecraft)
+
+
+# -----------------------------------------------------------------------
+# 8. TFLite Export for Embedded / Microcontroller Deployment
+# -----------------------------------------------------------------------
+
+def export_tflite(agent: DQNAgent, output_path: str = "sentinel_x_agent.tflite") -> bytes:
+    """
+    Convert a trained DQNAgent to TensorFlow Lite for embedded hardware.
+
+    Applies default optimisations (dynamic-range weight quantisation) so the
+    resulting model is suitable for microcontrollers with limited flash and
+    RAM budgets.
+
+    Parameters
+    ----------
+    agent : DQNAgent
+        A fully trained agent whose ``model`` attribute will be converted.
+    output_path : str
+        File path where the ``.tflite`` model will be written.
+
+    Returns
+    -------
+    bytes
+        The serialised TFLite flatbuffer (also written to *output_path*).
+    """
+    converter = tf.lite.TFLiteConverter.from_keras_model(agent.model)
+    converter.optimizations = [tf.lite.Optimize.DEFAULT]
+    tflite_model = converter.convert()
+    with open(output_path, "wb") as f:
+        f.write(tflite_model)
+    size_kb = len(tflite_model) / 1024
+    print(f"TFLite model exported to '{output_path}' ({size_kb:.1f} KB)")
+    return tflite_model
+
+
+# -----------------------------------------------------------------------
+# 9. Main Training Loop
 # -----------------------------------------------------------------------
 
 def run_do_nothing_baseline(episodes=10, max_steps=200):
@@ -404,35 +738,80 @@ def run_do_nothing_baseline(episodes=10, max_steps=200):
 
 
 if __name__ == "__main__":
-    STATE_DIM = 6
     ACTION_DIM = 4
     SWARM_SIZE = 5
     EPISODES = 200
     MAX_STEPS = 150
 
+    # ------------------------------------------------------------------
+    # 1. Basic swarm (independent agents, no federation)
+    # ------------------------------------------------------------------
+    STATE_DIM = 6
     swarm = Swarm(SWARM_SIZE, STATE_DIM, ACTION_DIM)
     rewards_per_episode = []
 
-    print("Training swarm...")
+    print("Training basic swarm...")
     for ep in range(EPISODES):
         avg_reward = swarm.train_episode(max_steps=MAX_STEPS)
         rewards_per_episode.append(avg_reward)
         if ep % 20 == 0:
             print(f"Episode {ep}: Avg Reward = {avg_reward:.2f}")
 
-    print("\nTesting trained agents...")
+    print("\nTesting basic swarm...")
     test_operational = swarm.test_episode(max_steps=200)
     print(f"Avg operational steps per spacecraft: {test_operational:.1f}")
 
     print("\nDo-nothing baseline...")
     run_do_nothing_baseline(episodes=10, max_steps=200)
 
-    # Save training curve to a file (non-interactive environments safe)
+    # ------------------------------------------------------------------
+    # 2. Federated swarm – mission profiles + coordination + TFLite
+    # ------------------------------------------------------------------
+    print("\n" + "=" * 60)
+    print("Federated swarm with mission-specific reward profiles")
+    print("=" * 60)
+
+    all_fed_rewards = {}
+    for profile_name in (
+        MissionProfile.BALANCED,
+        MissionProfile.MAXIMIZE_DATA_RETURN,
+        MissionProfile.EXTEND_LIFESPAN,
+    ):
+        print(f"\nProfile: {profile_name}")
+        fed_swarm = FederatedSwarm(
+            num_spacecraft=SWARM_SIZE,
+            action_dim=ACTION_DIM,
+            mission_profile=MissionProfile(profile_name),
+            federated_interval=10,
+        )
+        profile_rewards = []
+        for ep in range(EPISODES):
+            avg_reward = fed_swarm.train_episode(max_steps=MAX_STEPS)
+            profile_rewards.append(avg_reward)
+            if ep % 40 == 0:
+                print(f"  Episode {ep}: Avg Reward = {avg_reward:.2f}")
+
+        fed_ops = fed_swarm.test_episode(max_steps=200)
+        print(f"  Avg operational steps: {fed_ops:.1f}")
+        all_fed_rewards[profile_name] = profile_rewards
+
+    # ------------------------------------------------------------------
+    # 3. Export one trained agent to TFLite for embedded deployment
+    # ------------------------------------------------------------------
+    print("\nExporting agent to TFLite for microcontroller deployment...")
+    export_tflite(fed_swarm.agents[0], output_path="sentinel_x_agent.tflite")
+
+    # ------------------------------------------------------------------
+    # 4. Save training curves (basic swarm + all three fed profiles)
+    # ------------------------------------------------------------------
     plt.figure()
-    plt.plot(rewards_per_episode)
+    plt.plot(rewards_per_episode, label="Basic swarm")
+    for pname, rewards in all_fed_rewards.items():
+        plt.plot(rewards, label=f"Federated ({pname})")
     plt.xlabel("Episode")
     plt.ylabel("Avg Reward")
     plt.title("SENTINEL-X Swarm Training")
+    plt.legend()
     plt.tight_layout()
     plt.savefig("sentinel_x_training_curve.png")
     print("\nTraining curve saved to sentinel_x_training_curve.png")

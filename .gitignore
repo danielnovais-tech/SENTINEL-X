@@ -208,3 +208,4 @@ __marimo__/
 
 # SENTINEL-X generated output files
 sentinel_x_training_curve.png
+*.tflite
