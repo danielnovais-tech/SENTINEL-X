@@ -2619,6 +2619,7 @@ if __name__ == "__main__":
     N_ADV = 200
     adv_results = adv_tester.find_adversarial_examples(n_examples=N_ADV)
     adv_tester.summary(adv_results, n_tested=N_ADV)
+    flip_rate_before = len(adv_results) / N_ADV * 100
 
     # ------------------------------------------------------------------
     # 10. Adversarial training – harden the agent with augmented replay
@@ -2637,11 +2638,31 @@ if __name__ == "__main__":
 
     # Re-run adversarial test to measure improvement
     adv_results_post = adv_tester.find_adversarial_examples(n_examples=N_ADV)
+    flip_rate_after = len(adv_results_post) / N_ADV * 100
+    flip_rate_delta = flip_rate_before - flip_rate_after
+    print("=" * 55)
+    print("  Adversarial Augmentation – Flip-Rate Reduction")
+    print("=" * 55)
     print(
-        f"  Flip rate after augmentation: "
-        f"{len(adv_results_post)}/{N_ADV} "
-        f"({len(adv_results_post)/N_ADV*100:.1f}%)"
+        f"  Flip rate BEFORE augmentation : {flip_rate_before:.1f}%"
+        f" ({len(adv_results)}/{N_ADV})"
     )
+    print(
+        f"  Flip rate AFTER  augmentation : {flip_rate_after:.1f}%"
+        f" ({len(adv_results_post)}/{N_ADV})"
+    )
+    if flip_rate_delta >= 0:
+        print(
+            f"  Reduction                     : −{flip_rate_delta:.1f} pp"
+            f" ({flip_rate_delta / max(flip_rate_before, 1e-9) * 100:.1f}%"
+            " relative improvement)"
+        )
+    else:
+        print(
+            f"  Change                        : +{abs(flip_rate_delta):.1f} pp"
+            " (more training recommended)"
+        )
+    print("=" * 55)
 
     # ------------------------------------------------------------------
     # 11. Robustness certification
@@ -2763,3 +2784,24 @@ if __name__ == "__main__":
     plt.tight_layout()
     plt.savefig("sentinel_x_training_curve.png")
     print("\nTraining curve saved to sentinel_x_training_curve.png")
+
+    # ------------------------------------------------------------------
+    # 18. Final pipeline summary
+    # ------------------------------------------------------------------
+    sep = "=" * 60
+    print("\n" + sep)
+    print("  SENTINEL-X  –  Full Pipeline Complete")
+    print(sep)
+    print("  [✓] Agents trained with safety-aware loop")
+    print(f"  [✓] Adversarial augmentation: flip rate {flip_rate_before:.1f}% → "
+          f"{flip_rate_after:.1f}%  "
+          f"({'−' if flip_rate_delta >= 0 else '+'}"
+          f"{abs(flip_rate_delta):.1f} pp)")
+    print(f"  [✓] Robustness certified: mean radius = {cert['mean_radius']:.4f}, "
+          f"robust @ ε={cert['eps_hi']}: {cert['robust_frac']*100:.1f}%")
+    print("  [✓] Federation benchmark complete (FedAvg vs Gossip)")
+    print("  [✓] Dynamic-range TFLite  → sentinel_x_model.tflite")
+    print("  [✓] Int8-quantised TFLite → sentinel_x_model_int8.tflite")
+    print("  [✓] Policy verification report printed above")
+    print("  [✓] Training curve       → sentinel_x_training_curve.png")
+    print(sep)
