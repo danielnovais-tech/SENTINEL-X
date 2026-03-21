@@ -151,8 +151,8 @@ from sentinel_x_advanced import export_tflite, DQNAgent
 
 agent = DQNAgent(state_dim=7, action_dim=4)
 # ... train agent ...
-export_tflite(agent, output_path="sentinel_x_agent.tflite")
-# → TFLite model exported to 'sentinel_x_agent.tflite' (8.9 KB)
+export_tflite(agent, output_path="sentinel_x_model.tflite")
+# → TFLite model exported to 'sentinel_x_model.tflite' (8.9 KB)
 ```
 
 The converter applies dynamic-range weight quantisation (`tf.lite.Optimize.DEFAULT`), reducing the model footprint while preserving inference accuracy.

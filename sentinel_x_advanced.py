@@ -693,7 +693,7 @@ class FederatedSwarm(Swarm):
 # 8. TFLite Export for Embedded / Microcontroller Deployment
 # -----------------------------------------------------------------------
 
-def export_tflite(agent: DQNAgent, output_path: str = "sentinel_x_agent.tflite") -> bytes:
+def export_tflite(agent: DQNAgent, output_path: str = "sentinel_x_model.tflite") -> bytes:
     """
     Convert a trained DQNAgent to TensorFlow Lite for embedded hardware.
 
@@ -1024,7 +1024,7 @@ if __name__ == "__main__":
     # 3. Export one trained agent to TFLite for embedded deployment
     # ------------------------------------------------------------------
     print("\nExporting agent to TFLite for microcontroller deployment...")
-    export_tflite(fed_swarm.agents[0], output_path="sentinel_x_agent.tflite")
+    export_tflite(fed_swarm.agents[0], output_path="sentinel_x_model.tflite")
 
     # ------------------------------------------------------------------
     # 4. Formal verification of the best-trained agent's policy
