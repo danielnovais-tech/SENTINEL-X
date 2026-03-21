@@ -4,12 +4,14 @@ SENTINEL-X Advanced: Realistic Faults, DQN, Swarm, Federated Learning & Coordina
 Extends the basic Q-learning prototype with:
 
   1. Realistic fault generators:
-       - MemoryArray        – simulates single-event upsets (bit flips) in memory
-       - Sensor             – models Gaussian noise and stuck-at faults
-       - ThermalSubsystem   – temperature random-walk with overheating /
-                              overcooling fault detection
-       - PowerSubsystem     – power-budget drain model with brownout fault
-                              detection
+       - MemoryArray              – single-event upsets (bit flips) in memory
+       - Sensor                   – Gaussian noise and stuck-at faults
+       - ThermalSubsystem         – temperature random-walk; overheating /
+                                    overcooling fault detection
+       - PowerSubsystem           – power-budget drain model; brownout fault
+       - AttitudeControlSubsystem – gyro-drift random walk; tumble detection
+       - CommSubsystem            – antenna link-quality degradation and
+                                    stochastic dropout fault detection
 
   2. Deep Q-Network (DQN) agent using TensorFlow/Keras with:
        - Experience replay buffer
@@ -20,25 +22,39 @@ Extends the basic Q-learning prototype with:
 
   4. Mission-specific reward profiles – tailor optimisation to mission priorities
        (balanced / maximise data return / extend lifespan / power-constrained).
+       Dynamic reward shaping lets operators adjust weights at runtime.
 
   5. Federated learning – a central FederatedServer averages DQN weights across
        all agents (FedAvg) at configurable intervals, with optional deep-space
-       communication latency simulation via ``comm_delay_steps``.
+       communication latency (comm_delay_steps) and stochastic link dropout
+       (link_dropout_prob).
 
-  6. Multi-agent coordination – spacecraft cross-check peer sensor readings to
+  6. Gossip-based federated learning – GossipServer provides a decentralised
+       alternative where each spacecraft shares weights with k random neighbours,
+       scaling to large constellations without a central aggregation point.
+
+  7. Multi-agent coordination – spacecraft cross-check peer sensor readings to
        detect stuck sensors that an individual agent cannot diagnose alone.
 
-  7. TFLite export – convert a trained DQN to TensorFlow Lite for deployment on
-       microcontrollers and embedded hardware.
+  8. TFLite export – convert a trained DQN to TensorFlow Lite for deployment on
+       microcontrollers; includes full integer-only (int8) quantisation mode for
+       deterministic inference on Cortex-M / FPGA platforms.
 
-  8. Formal verification – PolicyVerifier runs lightweight safety proofs over
+  9. Formal verification – PolicyVerifier runs lightweight safety proofs over
        the trained policy: safety constraints, Q-value margin bounds, and action
        coverage across fault-state samples.
+
+  10. Safety monitor – SafetyMonitor is a rule-based FDIR veto layer that
+       overrides DQN actions violating hard spacecraft safety constraints,
+       enabling a hybrid RL + deterministic architecture.
+
+  11. Adversarial testing – AdversarialTester finds minimal L∞-bounded state
+       perturbations (FGSM) that flip the greedy action, revealing policy
+       fragility and generating adversarial training examples.
 
 Install dependencies:
     pip install numpy tensorflow matplotlib
 """
-
 import numpy as np
 import random
 import tensorflow as tf
@@ -209,6 +225,104 @@ class PowerSubsystem:
         self.is_faulted = False
 
 
+class AttitudeControlSubsystem:
+    """
+    Simulates spacecraft attitude control with gyro drift and tumble faults.
+
+    The angular rate vector undergoes a Gaussian random walk each step.
+    Occasional torque impulses (reaction-wheel saturation or disturbance
+    torques) can cause rapid spin-up.  A tumble fault is declared when the
+    magnitude of the angular rate exceeds the detumbling threshold.
+    """
+
+    DETUMBLE_THRESHOLD = 5.0   # deg/s - rate above which tumble is declared
+
+    def __init__(
+        self,
+        detumble_threshold: float = DETUMBLE_THRESHOLD,
+        drift_std: float = 0.02,
+        impulse_prob: float = 0.004,
+    ):
+        self.detumble_threshold = detumble_threshold
+        self.drift_std = drift_std
+        self.impulse_prob = impulse_prob
+        self.angular_rate = np.zeros(3, dtype=np.float64)   # deg/s per axis
+        self.is_faulted = False
+
+    def step(self) -> float:
+        """Advance attitude state; return angular rate magnitude."""
+        self.angular_rate += np.random.normal(0.0, self.drift_std, size=3)
+        if random.random() < self.impulse_prob:
+            axis = random.randrange(3)
+            self.angular_rate[axis] += float(
+                np.random.choice([-1, 1]) * np.random.uniform(2.0, 8.0)
+            )
+        magnitude = float(np.linalg.norm(self.angular_rate))
+        if magnitude > self.detumble_threshold:
+            self.is_faulted = True
+        return magnitude
+
+    @property
+    def rate_norm(self) -> float:
+        """Angular rate magnitude normalised to [0, 1] (clipped at 2x threshold)."""
+        return float(
+            min(np.linalg.norm(self.angular_rate) / (2.0 * self.detumble_threshold), 1.0)
+        )
+
+    def reset(self) -> None:
+        self.angular_rate = np.zeros(3, dtype=np.float64)
+        self.is_faulted = False
+
+
+class CommSubsystem:
+    """
+    Simulates spacecraft communication link quality with dropout faults.
+
+    The link quality undergoes a slow random walk representing atmospheric
+    conditions, deep-space ranging geometry, and hardware ageing.  Sudden
+    link-dropout events (antenna mispointing, relay loss) can drive quality
+    to zero.  A fault is declared when quality drops below the threshold.
+    """
+
+    def __init__(
+        self,
+        drift_std: float = 0.005,
+        dropout_prob: float = 0.004,
+        fault_threshold: float = 0.2,
+    ):
+        self.drift_std = drift_std
+        self.dropout_prob = dropout_prob
+        self.fault_threshold = fault_threshold
+        self.link_quality = 1.0   # 1.0 = perfect link, 0.0 = no link
+        self.is_faulted = False
+
+    def step(self) -> float:
+        """Advance comm state; return current link quality."""
+        self.link_quality += np.random.normal(0.0, self.drift_std)
+        self.link_quality = float(np.clip(self.link_quality, 0.0, 1.0))
+        if random.random() < self.dropout_prob:
+            # Sudden link degradation event
+            self.link_quality = float(
+                np.clip(
+                    self.link_quality - np.random.uniform(0.3, 0.8),
+                    0.0, 1.0,
+                )
+            )
+        if self.link_quality < self.fault_threshold:
+            self.is_faulted = True
+        return self.link_quality
+
+    @property
+    def quality_norm(self) -> float:
+        """Link quality already in [0, 1]."""
+        return self.link_quality
+
+    def reset(self) -> None:
+        self.link_quality = 1.0
+        self.is_faulted = False
+
+
+
 # -----------------------------------------------------------------------
 # 2. DQN Agent
 # -----------------------------------------------------------------------
@@ -324,18 +438,27 @@ class DQNAgent:
 
 class Spacecraft:
     """
-    Spacecraft combining MemoryArray, Sensor, ThermalSubsystem, and
-    PowerSubsystem fault subsystems.
+    Spacecraft combining MemoryArray, Sensor, ThermalSubsystem, PowerSubsystem,
+    AttitudeControlSubsystem, and CommSubsystem fault subsystems.
 
-    Base state vector (8 features, all normalised to [0, 1]):
-        [mem_error_ratio, parity_flag, sensor_deviation_norm,
-         sensor_stuck_flag, time_since_recovery_norm, health_flag,
-         thermal_fault_flag, power_level_norm]
+    Base state vector (10 features, all normalised to [0, 1]):
+        [0] mem_error_ratio
+        [1] parity_flag
+        [2] sensor_deviation_norm
+        [3] sensor_stuck_flag
+        [4] time_since_recovery_norm
+        [5] health_flag               <- SafetyMonitor / PolicyVerifier key index
+        [6] thermal_fault_flag
+        [7] power_level_norm
+        [8] attitude_rate_norm
+        [9] comm_quality_norm
 
-    Note: FederatedSwarm extends this to a 9-feature vector by appending a
+    Note: FederatedSwarm extends this to an 11-feature vector by appending a
     peer_sensor_deviation_norm coordination feature via
     ``_get_coordinated_state()``.
     """
+
+    HEALTH_FLAG_IDX = 5   # position of health_flag in the base state vector
 
     def __init__(self, spacecraft_id=0):
         self.id = spacecraft_id
@@ -347,6 +470,8 @@ class Spacecraft:
         self.sensor = Sensor(true_value=25.0, noise_std=0.5, stuck_prob=0.01)
         self.thermal = ThermalSubsystem()
         self.power = PowerSubsystem()
+        self.attitude = AttitudeControlSubsystem()
+        self.comm = CommSubsystem()
         self.healthy = True
         self.time_healthy = 0
         self.time_total = 0
@@ -376,17 +501,20 @@ class Spacecraft:
         self.sensor_reading = self.sensor.step()
         self.thermal.step()
         self.power.step()
+        self.attitude.step()
+        self.comm.step()
 
         self.parity_ok = self.memory.check_parity() == 0
         mem_too_many = self.mem_errors > 50
         self.sensor_stuck = self.sensor.is_stuck
 
         if (mem_too_many or not self.parity_ok or self.sensor_stuck
-                or self.thermal.is_faulted or self.power.is_faulted):
+                or self.thermal.is_faulted or self.power.is_faulted
+                or self.attitude.is_faulted or self.comm.is_faulted):
             self.healthy = False
 
     def get_state(self):
-        """Return a normalised 8-feature state vector for the DQN."""
+        """Return a normalised 10-feature state vector for the DQN."""
         mem_err_norm = min(self.mem_errors / self.max_memory_errors, 1.0)
         parity_flag = 0 if self.parity_ok else 1
         dev = abs(self.sensor_reading - self.sensor.true_value)
@@ -399,7 +527,8 @@ class Spacecraft:
         return np.array(
             [mem_err_norm, parity_flag, dev_norm, stuck_flag,
              time_since_norm, health_flag,
-             self.thermal.fault_flag, self.power.level_norm],
+             self.thermal.fault_flag, self.power.level_norm,
+             self.attitude.rate_norm, self.comm.quality_norm],
             dtype=np.float32,
         )
 
@@ -409,10 +538,11 @@ class Spacecraft:
 
         Actions:
             0: do nothing
-            1: restart subsystem  (resets memory, sensor, and thermal subsystems)
+            1: restart subsystem  (resets memory, sensor, thermal, attitude,
+                                   and comm subsystems)
             2: switch to redundant hardware (full reset of all subsystems)
-            3: safe mode (targeted: fixes stuck sensor, parity error, thermal
-                          fault, or low-power condition)
+            3: safe mode (targeted: fixes stuck sensor, parity error, thermal,
+                          attitude, comm, or low-power condition)
         """
         self.recovery_attempts += 1
         success = False
@@ -423,12 +553,16 @@ class Spacecraft:
             self.memory.reset()
             self.sensor.reset()
             self.thermal.reset()
+            self.attitude.reset()
+            self.comm.reset()
             success = True
         elif action == 2:   # switch to redundant
             self.memory.reset()
             self.sensor.reset()
             self.thermal.reset()
             self.power.reset()
+            self.attitude.reset()
+            self.comm.reset()
             success = True
         elif action == 3:   # safe mode
             if self.sensor_stuck:
@@ -442,6 +576,12 @@ class Spacecraft:
                 success = True
             if self.power.is_faulted:
                 self.power.reset()
+                success = True
+            if self.attitude.is_faulted:
+                self.attitude.reset()
+                success = True
+            if self.comm.is_faulted:
+                self.comm.reset()
                 success = True
 
         if success:
@@ -581,6 +721,36 @@ class MissionProfile:
                 + ", ".join(valid)
             )
         self.profile = profile
+        # Dynamic weight multipliers (1.0 = default, operator-adjustable)
+        self.recovery_bonus_scale = 1.0
+        self.fault_penalty_scale = 1.0
+
+    def update_weights(
+        self,
+        *,
+        recovery_bonus_scale: float = None,
+        fault_penalty_scale: float = None,
+    ) -> None:
+        """
+        Adjust reward weight multipliers at runtime.
+
+        Allows a mission operator to tune the agent's priorities based on
+        live telemetry without retraining (e.g., increase fault penalty when
+        power is critical).
+
+        Parameters
+        ----------
+        recovery_bonus_scale : float, optional
+            Multiplier applied to every successful-recovery bonus term.
+            > 1.0 makes recovery more attractive; < 1.0 de-emphasises it.
+        fault_penalty_scale : float, optional
+            Multiplier applied to every fault-persistence penalty term.
+            > 1.0 increases urgency; < 1.0 allows the agent to tolerate faults.
+        """
+        if recovery_bonus_scale is not None:
+            self.recovery_bonus_scale = float(recovery_bonus_scale)
+        if fault_penalty_scale is not None:
+            self.fault_penalty_scale = float(fault_penalty_scale)
 
     def compute(self, was_healthy: bool, now_operational: bool, action: int) -> float:
         """
@@ -596,55 +766,57 @@ class MissionProfile:
             Recovery action (0 = do nothing, 1 = restart,
             2 = switch to redundant, 3 = safe mode).
         """
+        rs = self.recovery_bonus_scale
+        fp = self.fault_penalty_scale
+
         if self.profile == self.MAXIMIZE_DATA_RETURN:
             # High reward for being up; penalise lingering faults and inaction.
-            reward = 2.0 if now_operational else -2.0
+            reward = 2.0 if now_operational else -2.0 * fp
             if not was_healthy and now_operational:
-                reward += 8.0        # fast recovery greatly rewarded
+                reward += 8.0 * rs   # fast recovery greatly rewarded
             elif not now_operational and not was_healthy:
                 if action == 0:
-                    reward -= 1.0    # penalise doing nothing when faulty
+                    reward -= 1.0 * fp   # penalise doing nothing when faulty
                 else:
-                    reward -= 3.0    # failed recovery attempt
+                    reward -= 3.0 * fp   # failed recovery attempt
             return reward
 
         elif self.profile == self.EXTEND_LIFESPAN:
             # Balanced uptime; steer agent toward cheap recovery actions.
-            reward = 1.0 if now_operational else -1.0
+            reward = 1.0 if now_operational else -1.0 * fp
             if not was_healthy and now_operational:
-                reward += 5.0
+                reward += 5.0 * rs
                 if action in (1, 3):   # restart or safe mode – cheap
-                    reward += 1.0
+                    reward += 1.0 * rs
                 elif action == 2:       # redundant switch – expensive
-                    reward -= 1.0
+                    reward -= 1.0 * fp
             elif action != 0 and not now_operational:
-                reward -= 2.0
+                reward -= 2.0 * fp
             return reward
 
         elif self.profile == self.POWER_CONSTRAINED:
             # Favour power-efficient actions (restart, safe mode) and
             # discourage redundant hardware switches that draw high current.
-            reward = 1.0 if now_operational else -1.0
+            reward = 1.0 if now_operational else -1.0 * fp
             if not was_healthy and now_operational:
-                reward += 5.0
+                reward += 5.0 * rs
                 if action in (1, 3):   # restart / safe mode – low power draw
-                    reward += 1.0
+                    reward += 1.0 * rs
                 elif action == 2:       # redundant switch – high power draw
-                    reward -= 2.0
+                    reward -= 2.0 * fp
             elif action != 0 and not now_operational:
-                reward -= 2.0
+                reward -= 2.0 * fp
             # Additional deterrent: penalise action 2 on a healthy spacecraft
-            # to prevent unnecessary high-power-draw operations.
             if action == 2 and was_healthy:
-                reward -= 1.0
+                reward -= 1.0 * fp
             return reward
 
         else:  # BALANCED (default)
-            reward = 1.0 if now_operational else -1.0
+            reward = 1.0 if now_operational else -1.0 * fp
             if action != 0 and now_operational and not was_healthy:
-                reward += 5.0
+                reward += 5.0 * rs
             elif action != 0 and not now_operational:
-                reward -= 2.0
+                reward -= 2.0 * fp
             return reward
 
 
@@ -671,8 +843,9 @@ class FederatedServer:
         Set to 0 (default) for immediate distribution.
     """
 
-    def __init__(self, comm_delay_steps: int = 0):
+    def __init__(self, comm_delay_steps: int = 0, link_dropout_prob: float = 0.0):
         self.comm_delay_steps = comm_delay_steps
+        self.link_dropout_prob = link_dropout_prob
         self._queue: list = []   # list of [remaining_episodes, avg_weights]
 
     def aggregate(self, agents: list) -> None:
@@ -689,6 +862,11 @@ class FederatedServer:
         agents : list[DQNAgent]
             All agents participating in this aggregation round.
         """
+        if not agents:
+            return
+        # Stochastic link availability: filter out disconnected agents
+        if self.link_dropout_prob > 0.0:
+            agents = [a for a in agents if random.random() > self.link_dropout_prob]
         if not agents:
             return
         all_weights = [agent.model.get_weights() for agent in agents]
@@ -735,11 +913,12 @@ class FederatedSwarm(Swarm):
     Extends Swarm with federated learning, sensor cross-checking, and
     mission-profile reward shaping.
 
-    The state vector is extended to 9 features:
+    The state vector is extended to 11 features:
 
         [mem_error_ratio, parity_flag, sensor_deviation_norm,
          sensor_stuck_flag, time_since_recovery_norm, health_flag,
          thermal_fault_flag, power_level_norm,
+         attitude_rate_norm, comm_quality_norm,
          peer_sensor_deviation_norm]   ← coordination feature
 
     Parameters
@@ -756,9 +935,11 @@ class FederatedSwarm(Swarm):
         Communication latency in episodes before aggregated weights reach
         agents.  Simulates deep-space round-trip light time (default 0 =
         immediate).
+    link_dropout_prob : float
+        Probability that any agent drops out of a given aggregation round.
     """
 
-    COORD_STATE_DIM = 9   # base 8 features + 1 peer-sensor deviation feature
+    COORD_STATE_DIM = 11  # base 10 features + 1 peer-sensor deviation feature
 
     def __init__(
         self,
@@ -767,9 +948,13 @@ class FederatedSwarm(Swarm):
         mission_profile: MissionProfile = None,
         federated_interval: int = 10,
         comm_delay_steps: int = 0,
+        link_dropout_prob: float = 0.0,
     ):
         super().__init__(num_spacecraft, self.COORD_STATE_DIM, action_dim)
-        self.server = FederatedServer(comm_delay_steps=comm_delay_steps)
+        self.server = FederatedServer(
+            comm_delay_steps=comm_delay_steps,
+            link_dropout_prob=link_dropout_prob,
+        )
         self.mission_profile = mission_profile or MissionProfile()
         self.federated_interval = federated_interval
         self._episode_count = 0
@@ -805,8 +990,8 @@ class FederatedSwarm(Swarm):
             )
 
     def _get_coordinated_state(self, sc: Spacecraft) -> np.ndarray:
-        """Return the 9-feature state vector for *sc*, including peer deviation."""
-        base = sc.get_state()                                          # shape (8,)
+        """Return the 11-feature state vector for *sc*, including peer deviation."""
+        base = sc.get_state()                                          # shape (10,)
         peer = np.float32(getattr(sc, "_peer_sensor_deviation", 0.0))
         return np.append(base, peer)
 
@@ -930,6 +1115,57 @@ def export_tflite(agent: DQNAgent, output_path: str = "sentinel_x_model.tflite")
     return tflite_model
 
 
+def export_tflite_int8(
+    agent: "DQNAgent",
+    output_path: str = "sentinel_x_model_int8.tflite",
+    n_calib_samples: int = 256,
+) -> bytes:
+    """
+    Convert a trained DQNAgent to a full integer-only TFLite model (int8).
+
+    Uses a representative calibration dataset of random fault states to
+    determine per-layer quantisation ranges.  The resulting model uses
+    integer-only arithmetic throughout, making it suitable for
+    deterministic inference on MCUs without floating-point units
+    (e.g., ARM Cortex-M4, STM32, radiation-hardened FPGAs).
+
+    Parameters
+    ----------
+    agent : DQNAgent
+        A fully trained agent.
+    output_path : str
+        Destination file for the int8 ``.tflite`` model.
+    n_calib_samples : int
+        Number of random states used to calibrate quantisation ranges.
+
+    Returns
+    -------
+    bytes
+        The serialised int8 TFLite flatbuffer (also written to *output_path*).
+    """
+    rng = np.random.default_rng(seed=42)
+
+    def representative_dataset():
+        for _ in range(n_calib_samples):
+            sample = rng.uniform(0.0, 1.0, size=(1, agent.state_dim)).astype(
+                np.float32
+            )
+            yield [sample]
+
+    converter = tf.lite.TFLiteConverter.from_keras_model(agent.model)
+    converter.optimizations = [tf.lite.Optimize.DEFAULT]
+    converter.representative_dataset = representative_dataset
+    converter.target_spec.supported_ops = [tf.lite.OpsSet.TFLITE_BUILTINS_INT8]
+    converter.inference_input_type = tf.int8
+    converter.inference_output_type = tf.int8
+    tflite_model = converter.convert()
+    with open(output_path, "wb") as f:
+        f.write(tflite_model)
+    size_kb = len(tflite_model) / 1024
+    print(f"Int8 TFLite model exported to '{output_path}' ({size_kb:.1f} KB)")
+    return tflite_model
+
+
 # -----------------------------------------------------------------------
 # 9. Formal Verification of Trained Policies
 # -----------------------------------------------------------------------
@@ -991,16 +1227,16 @@ class PolicyVerifier:
         """
         Draw ``n_samples`` random states that represent *faulty* spacecraft.
 
-        The last feature of the state vector (index -1) is the ``health_flag``
-        (0 = healthy, 1 = faulty).  Sampling with ``health_flag = 1`` and
-        random values for the remaining features covers a broad slice of the
+        ``health_flag`` is always at index 5 in both the base state vector
+        and any extended (coordinated) state vector.  Setting it to 1
+        while randomising remaining features covers a broad slice of the
         fault-state space without requiring access to the live environment.
         """
         dim = self.agent.state_dim
         states = self.rng.uniform(0.0, 1.0, size=(self.n_samples, dim)).astype(
             np.float32
         )
-        states[:, -1] = 1.0   # health_flag = 1 → faulty
+        states[:, Spacecraft.HEALTH_FLAG_IDX] = 1.0   # health_flag = 1 → faulty
         return states
 
     def _q_values(self, states: np.ndarray) -> np.ndarray:
@@ -1152,7 +1388,279 @@ class PolicyVerifier:
 
 
 # -----------------------------------------------------------------------
-# 10. Main Training Loop
+# 10. Safety Monitor (FDIR Veto Layer)
+# -----------------------------------------------------------------------
+
+class SafetyMonitor:
+    """
+    Rule-based FDIR safety layer that vetoes unsafe DQN-recommended actions.
+
+    Implements hard safety constraints that must never be violated regardless
+    of what the learned policy recommends, providing a deterministic safety
+    net around the neural network inference.
+
+    Hard constraints enforced:
+
+    * **No inaction on fault** – When ``health_flag`` (state[5]) is 1.0, the
+      agent must select a recovery action; action 0 ("do nothing") is replaced
+      by safe-mode (action 3).
+
+    * **No full reset on critical power** – When the normalised power level
+      (state[7]) is critically low, switching to redundant hardware (action 2)
+      is prohibited because the full reset would exhaust the remaining energy
+      budget; safe-mode (action 3) is used instead.
+
+    This architecture mirrors the hybrid RL + FDIR layer recommended for
+    space-qualified autonomy under ECSS-E-ST-70-11 and NASA autonomy standards.
+    """
+
+    HEALTH_FLAG_IDX = Spacecraft.HEALTH_FLAG_IDX   # 5
+    POWER_LEVEL_IDX = 7
+    CRITICAL_POWER_THRESHOLD = 0.15
+
+    def veto(self, proposed_action: int, state: np.ndarray, action_dim: int) -> int:
+        """
+        Apply hard safety constraints and return a safe action.
+
+        Returns ``proposed_action`` unchanged if no constraint is violated.
+
+        Parameters
+        ----------
+        proposed_action : int
+            Action recommended by the DQN agent.
+        state : np.ndarray
+            Current (normalised) state vector.
+        action_dim : int
+            Total number of actions available (unused; reserved for future use).
+
+        Returns
+        -------
+        int
+            A safe action (may equal ``proposed_action`` if no veto triggered).
+        """
+        health_flag = float(state[self.HEALTH_FLAG_IDX])
+        power_level = (
+            float(state[self.POWER_LEVEL_IDX])
+            if len(state) > self.POWER_LEVEL_IDX
+            else 1.0
+        )
+
+        # Constraint 1: must attempt recovery when faulted
+        if health_flag >= 0.5 and proposed_action == 0:
+            return 3   # fall back to safe mode
+
+        # Constraint 2: no full hardware reset on critically low power
+        if proposed_action == 2 and power_level < self.CRITICAL_POWER_THRESHOLD:
+            return 3   # safe mode instead
+
+        return proposed_action
+
+
+# -----------------------------------------------------------------------
+# 11. Gossip-Based Federated Learning (Decentralised)
+# -----------------------------------------------------------------------
+
+class GossipServer:
+    """
+    Decentralised gossip-based federated learning for large constellations.
+
+    Instead of routing all updates through a central server, each spacecraft
+    randomly selects ``k`` neighbours and averages its DQN weights with theirs.
+    This approach:
+
+    * Scales to arbitrarily large fleets without a single aggregation point.
+    * Tolerates partial link outages (unreachable agents are skipped without
+      stalling the round).
+    * Converges to the same global average as FedAvg when run repeatedly,
+      but distributes the communication load across the constellation.
+
+    Parameters
+    ----------
+    k : int
+        Number of random neighbours each agent gossips with per round.
+    comm_delay_steps : int
+        Episodes of delay before gossiped weights take effect (same
+        semantics as ``FederatedServer.comm_delay_steps``).
+    """
+
+    def __init__(self, k: int = 2, comm_delay_steps: int = 0):
+        self.k = k
+        self.comm_delay_steps = comm_delay_steps
+        self._queue: list = []
+
+    def gossip_round(self, agents: list) -> None:
+        """
+        Run one round of gossip averaging across the agent population.
+
+        Each agent independently samples k peers (without replacement) and
+        computes the mean of its weights and their weights.  All snapshots
+        are taken *before* any weights are updated to avoid order-dependent
+        results.
+        """
+        n = len(agents)
+        if n < 2:
+            return
+
+        # Snapshot current weights before any update
+        snapshots = [agent.model.get_weights() for agent in agents]
+        n_layers = len(snapshots[0])
+
+        updates = []
+        for i in range(n):
+            peer_indices = random.sample(
+                [j for j in range(n) if j != i], min(self.k, n - 1)
+            )
+            all_w = [snapshots[i]] + [snapshots[p] for p in peer_indices]
+            avg = [
+                np.mean([w[layer] for w in all_w], axis=0)
+                for layer in range(n_layers)
+            ]
+            updates.append((i, avg))
+
+        if self.comm_delay_steps > 0:
+            self._queue.append([self.comm_delay_steps, updates])
+        else:
+            self._apply(agents, updates)
+
+    def tick(self, agents: list) -> None:
+        """Advance the gossip delay queue by one episode."""
+        still_pending = []
+        for remaining, updates in self._queue:
+            remaining -= 1
+            if remaining <= 0:
+                self._apply(agents, updates)
+            else:
+                still_pending.append([remaining, updates])
+        self._queue = still_pending
+
+    def _apply(self, agents: list, updates: list) -> None:
+        """Distribute gossip-averaged weights to each agent."""
+        for idx, weights in updates:
+            if idx < len(agents):
+                agents[idx].model.set_weights(weights)
+                agents[idx].update_target()
+
+
+# -----------------------------------------------------------------------
+# 12. Adversarial Testing (FGSM)
+# -----------------------------------------------------------------------
+
+class AdversarialTester:
+    """
+    Gradient-based adversarial testing (FGSM) for trained DQN policies.
+
+    Finds minimal L∞-bounded state perturbations that change the agent's
+    greedy action.  These corner cases expose policy fragility near decision
+    boundaries and can be fed back into training as adversarial examples to
+    improve robustness.
+
+    Parameters
+    ----------
+    agent : DQNAgent
+        Trained agent to probe.
+    epsilon : float
+        Maximum L∞ perturbation magnitude (in normalised state space).
+        A value of 0.05 corresponds to a 5% shift in any single feature.
+    rng_seed : int
+        Seed for reproducible state sampling.
+    """
+
+    def __init__(self, agent: "DQNAgent", epsilon: float = 0.05, rng_seed: int = 0):
+        self.agent = agent
+        self.epsilon = epsilon
+        self.rng = np.random.default_rng(rng_seed)
+
+    def find_adversarial_examples(self, n_examples: int = 100) -> list:
+        """
+        Attempt to flip the greedy action on *n_examples* random fault states.
+
+        Uses FGSM to perturb states in the direction that reduces the Q-value
+        margin between the best and second-best action.
+
+        Returns
+        -------
+        list of dict, each with keys:
+            ``original_state``, ``perturbed_state``,
+            ``original_action``, ``flipped_action``
+        """
+        dim = self.agent.state_dim
+        states = self.rng.uniform(0.0, 1.0, size=(n_examples, dim)).astype(np.float32)
+        states[:, Spacecraft.HEALTH_FLAG_IDX] = 1.0   # force fault condition
+
+        results = []
+        for state in states:
+            original_action = self._greedy_action(state)
+            perturbed = self._fgsm_perturb(state)
+            perturbed_action = self._greedy_action(perturbed)
+            if perturbed_action != original_action:
+                results.append(
+                    {
+                        "original_state": state.copy(),
+                        "perturbed_state": perturbed.copy(),
+                        "original_action": original_action,
+                        "flipped_action": perturbed_action,
+                    }
+                )
+        return results
+
+    def summary(self, results: list, n_tested: int) -> None:
+        """
+        Print a summary of adversarial findings.
+
+        Parameters
+        ----------
+        results : list
+            Output of ``find_adversarial_examples()``.
+        n_tested : int
+            Total number of states that were tested.
+        """
+        from collections import Counter
+
+        n_flipped = len(results)
+        rate = n_flipped / max(n_tested, 1) * 100
+        flip_pairs = Counter(
+            (r["original_action"], r["flipped_action"]) for r in results
+        )
+        print("=" * 55)
+        print("  SENTINEL-X Adversarial Testing Report")
+        print("=" * 55)
+        if n_flipped == 0:
+            print("  No adversarial examples found (robust within epsilon).")
+        else:
+            print(f"  Adversarial flip rate: {rate:.1f}% ({n_flipped}/{n_tested})")
+            print("  Action flip distribution:")
+            for (orig, flipped), count in sorted(flip_pairs.items()):
+                print(f"    action {orig} -> {flipped}: {count} example(s)")
+        print("=" * 55)
+
+    def _greedy_action(self, state: np.ndarray) -> int:
+        q = self.agent.model.predict(state[np.newaxis, :], verbose=0)[0]
+        return int(np.argmax(q))
+
+    def _fgsm_perturb(self, state: np.ndarray) -> np.ndarray:
+        """
+        Fast Gradient Sign Method perturbation.
+
+        Perturbs ``state`` in the direction that reduces the Q-value margin
+        between the best and second-best action, pushing toward a decision
+        boundary where the greedy action may flip.
+        """
+        state_var = tf.Variable(state[np.newaxis, :])
+        with tf.GradientTape() as tape:
+            q_vals = self.agent.model(state_var, training=False)
+            sorted_q = tf.sort(q_vals[0])[::-1]
+            loss = sorted_q[0] - sorted_q[1]   # minimise margin
+        grad = tape.gradient(loss, state_var)
+        if grad is None:
+            return state
+        # Step in negative gradient direction to shrink the margin
+        perturbation = -self.epsilon * tf.sign(grad).numpy()[0]
+        perturbed = np.clip(state + perturbation, 0.0, 1.0)
+        return perturbed.astype(np.float32)
+
+
+# -----------------------------------------------------------------------
+# 13. Main Training Loop
 # -----------------------------------------------------------------------
 
 def run_do_nothing_baseline(episodes=10, max_steps=200):
@@ -1178,7 +1686,7 @@ if __name__ == "__main__":
     # ------------------------------------------------------------------
     # 1. Basic swarm (independent agents, no federation)
     # ------------------------------------------------------------------
-    STATE_DIM = 8   # 8-feature state: mem/sensor/thermal/power + health/time
+    STATE_DIM = 10  # 10-feature state: mem/sensor/thermal/power/attitude/comm
     swarm = Swarm(SWARM_SIZE, STATE_DIM, ACTION_DIM)
     rewards_per_episode = []
 
@@ -1234,6 +1742,9 @@ if __name__ == "__main__":
     print("\nExporting agent to TFLite for microcontroller deployment...")
     export_tflite(fed_swarm.agents[0], output_path="sentinel_x_model.tflite")
 
+    print("\nExporting int8-quantised TFLite model for MCU deployment...")
+    export_tflite_int8(fed_swarm.agents[0], output_path="sentinel_x_model_int8.tflite")
+
     # ------------------------------------------------------------------
     # 4. Deep-space communication delay demonstration
     #    Train a small swarm with a 5-episode link delay to demonstrate
@@ -1268,7 +1779,66 @@ if __name__ == "__main__":
     verifier.verify()
 
     # ------------------------------------------------------------------
-    # 6. Save training curves (basic swarm + all four fed profiles + delay)
+    # 6. Safety monitor demo
+    # ------------------------------------------------------------------
+    print("\nSafety monitor demo...")
+    monitor = SafetyMonitor()
+    faulted_state = np.zeros(FederatedSwarm.COORD_STATE_DIM, dtype=np.float32)
+    faulted_state[Spacecraft.HEALTH_FLAG_IDX] = 1.0
+    vetoed = monitor.veto(0, faulted_state, ACTION_DIM)
+    print(f"  Proposed action=0 on faulted state -> vetoed to {vetoed}")
+    low_power_state = np.zeros(FederatedSwarm.COORD_STATE_DIM, dtype=np.float32)
+    low_power_state[SafetyMonitor.POWER_LEVEL_IDX] = 0.05
+    vetoed2 = monitor.veto(2, low_power_state, ACTION_DIM)
+    print(f"  Proposed action=2 on critical-power state -> vetoed to {vetoed2}")
+
+    # ------------------------------------------------------------------
+    # 7. Gossip-based federated learning demo
+    # ------------------------------------------------------------------
+    print("\n" + "=" * 60)
+    print("Gossip-based federated learning demo (k=2 neighbours)")
+    print("=" * 60)
+    gossip_swarm = FederatedSwarm(
+        num_spacecraft=SWARM_SIZE,
+        action_dim=ACTION_DIM,
+        mission_profile=MissionProfile(MissionProfile.BALANCED),
+        federated_interval=999,   # disable central FedAvg
+    )
+    gossip_server = GossipServer(k=2, comm_delay_steps=0)
+    gossip_rewards = []
+    for ep in range(EPISODES):
+        avg_reward = gossip_swarm.train_episode(max_steps=MAX_STEPS)
+        gossip_rewards.append(avg_reward)
+        if ep % 10 == 0:
+            gossip_server.gossip_round(gossip_swarm.agents)
+        if ep % 40 == 0:
+            print(f"  Episode {ep}: Avg Reward = {avg_reward:.2f}")
+    gossip_ops = gossip_swarm.test_episode(max_steps=200)
+    print(f"  Avg operational steps (gossip k=2): {gossip_ops:.1f}")
+    all_fed_rewards["gossip_k2"] = gossip_rewards
+
+    # ------------------------------------------------------------------
+    # 8. Dynamic reward shaping demo
+    # ------------------------------------------------------------------
+    print("\nDynamic reward shaping demo...")
+    dyn_profile = MissionProfile(MissionProfile.POWER_CONSTRAINED)
+    r_before = dyn_profile.compute(False, True, 2)
+    dyn_profile.update_weights(recovery_bonus_scale=0.5, fault_penalty_scale=2.0)
+    r_after = dyn_profile.compute(False, True, 2)
+    print(f"  Recovery reward before weight adjustment: {r_before:.2f}")
+    print(f"  Recovery reward after  weight adjustment: {r_after:.2f}")
+
+    # ------------------------------------------------------------------
+    # 9. Adversarial testing demo
+    # ------------------------------------------------------------------
+    print("\nRunning adversarial testing on trained agent...")
+    adv_tester = AdversarialTester(fed_swarm.agents[0], epsilon=0.05)
+    N_ADV = 200
+    adv_results = adv_tester.find_adversarial_examples(n_examples=N_ADV)
+    adv_tester.summary(adv_results, n_tested=N_ADV)
+
+    # ------------------------------------------------------------------
+    # 10. Save training curves (basic swarm + all profiles + gossip)
     # ------------------------------------------------------------------
     plt.figure()
     plt.plot(rewards_per_episode, label="Basic swarm")

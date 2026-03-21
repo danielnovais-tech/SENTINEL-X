@@ -12,13 +12,16 @@ Deep-space systems are fragile, and rule-based recovery can't keep pace with unp
 
 - **Basic Q-learning simulation** (`sentinel_x.py`) – A tabular Q-learning agent learns to recover a simulated spacecraft from random faults (memory corruption, sensor failure, CPU hang).
 - **Advanced DQN simulation** (`sentinel_x_advanced.py`) – Extends the prototype with:
-  - **Realistic fault generators**: `MemoryArray` (single-event upsets / bit flips), `Sensor` (Gaussian noise + stuck-at), `ThermalSubsystem` (overheating / overcooling), and `PowerSubsystem` (brownout / power depletion).
+  - **Realistic fault generators**: `MemoryArray` (SEUs/bit flips), `Sensor` (Gaussian noise + stuck-at), `ThermalSubsystem` (overheating/overcooling), `PowerSubsystem` (brownout), `AttitudeControlSubsystem` (gyro-drift/tumble), and `CommSubsystem` (link-quality degradation/dropout).
   - **Deep Q-Network (DQN) agent** using TensorFlow/Keras with experience replay and a separate target network.
   - **Swarm simulation** – multiple spacecraft each managed by an independent DQN agent.
-  - **Mission-specific reward profiles** – `MissionProfile` lets you tune the reward function to mission priorities (balanced, data-return, lifespan, power-constrained).
-  - **Federated learning** – `FederatedServer` averages DQN weights across all agents (FedAvg), with optional deep-space communication latency simulation via `comm_delay_steps`.
+  - **Mission-specific reward profiles** – `MissionProfile` lets you tune the reward function to mission priorities (balanced, data-return, lifespan, power-constrained) with runtime-adjustable weights via `update_weights()`.
+  - **Federated learning** – `FederatedServer` averages DQN weights across all agents (FedAvg), with optional deep-space communication latency (`comm_delay_steps`) and stochastic link dropout (`link_dropout_prob`).
+  - **Gossip-based federation** – `GossipServer` provides a decentralised alternative where each spacecraft gossips with k random neighbours, scaling to large constellations without a central server.
   - **Multi-agent coordination** – `FederatedSwarm` cross-checks peer sensor readings to detect stuck sensors that individual agents cannot diagnose alone.
-  - **TFLite export** – `export_tflite()` quantises and serialises a trained DQN for microcontroller deployment.
+  - **TFLite export** – `export_tflite()` (dynamic-range) and `export_tflite_int8()` (full int8, for Cortex-M / MCU) serialise a trained DQN for embedded deployment.
+  - **Safety monitor** – `SafetyMonitor` is a rule-based FDIR veto layer: never "do nothing" on a fault, never reset hardware on critically low power.
+  - **Adversarial testing** – `AdversarialTester` uses FGSM to find minimal state perturbations that flip the greedy action, revealing policy fragility.
   - **Formal verification** – `PolicyVerifier` runs lightweight safety proofs (safety constraint, Q-value margin, action coverage) over a trained policy and prints a CI-friendly report.
 
 ---
@@ -47,48 +50,59 @@ Trains a tabular Q-learning agent for 500 episodes and then evaluates it against
 python sentinel_x_advanced.py
 ```
 
-Trains a basic swarm and then a `FederatedSwarm` under each of the four mission profiles, evaluates the trained agents, exports a TFLite model, demonstrates deep-space communication latency, and saves the training curves to `sentinel_x_training_curve.png`.
+Trains a basic swarm and then a `FederatedSwarm` under each of the four mission profiles, exports both dynamic-range and int8 TFLite models, demonstrates deep-space communication latency, gossip-based federation, dynamic reward shaping, safety monitor, and adversarial testing. Training curves are saved to `sentinel_x_training_curve.png`.
 
 ---
 
 ## Architecture Overview
 
 ```
-┌──────────────────────────────────────────────────────────────┐
-│                      SENTINEL-X System                       │
-├────────────────────┬─────────────────────────────────────────┤
-│  Fault Generators  │  MemoryArray (bit flips)                 │
-│                    │  Sensor (noise / stuck-at)               │
-│                    │  ThermalSubsystem (overheating / overcooling) │
-│                    │  PowerSubsystem (brownout / depletion)   │
-├────────────────────┼─────────────────────────────────────────┤
-│  Spacecraft        │  Aggregates subsystem health,            │
-│  Environment       │  produces 8-dim normalised state vector  │
-├────────────────────┼─────────────────────────────────────────┤
-│  Recovery Agent    │  DQN (64→64→actions) with replay         │
-│                    │  buffer and target network               │
-├────────────────────┼─────────────────────────────────────────┤
-│  Swarm             │  N independent spacecraft + agents       │
-├────────────────────┼─────────────────────────────────────────┤
-│  FederatedSwarm    │  Swarm + peer sensor cross-check         │
-│                    │  (9-dim state) + MissionProfile          │
-├────────────────────┼─────────────────────────────────────────┤
-│  FederatedServer   │  FedAvg weight aggregation with          │
-│                    │  optional deep-space comm-delay queue    │
-├────────────────────┼─────────────────────────────────────────┤
-│  PolicyVerifier    │  Formal safety checks: constraint,       │
-│                    │  Q-margin bound, action coverage         │
-└────────────────────┴─────────────────────────────────────────┘
++----------------------+------------------------------------------+
+| SENTINEL-X System                                               |
++----------------------+------------------------------------------+
+| Fault Generators     | MemoryArray (bit flips)                  |
+|                      | Sensor (noise / stuck-at)                |
+|                      | ThermalSubsystem (overheating/cooling)   |
+|                      | PowerSubsystem (brownout/depletion)      |
+|                      | AttitudeControlSubsystem (gyro/tumble)   |
+|                      | CommSubsystem (link dropout/degradation) |
++----------------------+------------------------------------------+
+| Spacecraft           | Aggregates subsystem health,             |
+| Environment          | produces 10-dim normalised state vector  |
++----------------------+------------------------------------------+
+| Recovery Agent       | DQN (64->64->actions) with replay        |
+|                      | buffer and target network                |
++----------------------+------------------------------------------+
+| SafetyMonitor        | FDIR veto layer: hard safety rules       |
+|                      | override unsafe DQN recommendations      |
++----------------------+------------------------------------------+
+| Swarm                | N independent spacecraft + agents        |
++----------------------+------------------------------------------+
+| FederatedSwarm       | Swarm + peer sensor cross-check          |
+|                      | (11-dim state) + MissionProfile          |
++----------------------+------------------------------------------+
+| FederatedServer      | FedAvg with comm-delay queue &           |
+|                      | stochastic link-dropout simulation       |
++----------------------+------------------------------------------+
+| GossipServer         | Decentralised k-neighbour gossip         |
+|                      | averaging (no central server needed)     |
++----------------------+------------------------------------------+
+| PolicyVerifier       | Formal safety checks: constraint,        |
+|                      | Q-margin bound, action coverage          |
++----------------------+------------------------------------------+
+| AdversarialTester    | FGSM corner-case discovery;              |
+|                      | generates adversarial training examples  |
++----------------------+------------------------------------------+
 ```
 
 ### Recovery Actions
 
 | Action | Description                          | Effective against                              |
 |--------|--------------------------------------|------------------------------------------------|
-| 0      | Do nothing                           | —                                              |
-| 1      | Restart subsystem                    | Memory errors, sensor noise, thermal faults    |
-| 2      | Switch to redundant hardware         | All fault types (full reset, high power draw)  |
-| 3      | Safe mode (targeted)                 | Stuck sensor, parity error, thermal, brownout  |
+| 0      | Do nothing                           | —                                                         |
+| 1      | Restart subsystem                    | Memory, sensor, thermal, attitude, comm faults            |
+| 2      | Switch to redundant hardware         | All fault types (full reset; high power draw)             |
+| 3      | Safe mode (targeted)                 | Stuck sensor, parity, thermal, power, attitude, comm      |
 
 ---
 
@@ -111,8 +125,12 @@ swarm = FederatedSwarm(
     action_dim=4,
     mission_profile=MissionProfile(MissionProfile.MAXIMIZE_DATA_RETURN),
     federated_interval=10,
+    link_dropout_prob=0.1,   # 10% stochastic link outage
 )
 avg_reward = swarm.train_episode(max_steps=150)
+
+# Adjust reward weights at runtime
+swarm.mission_profile.update_weights(fault_penalty_scale=2.0)
 ```
 
 ---
@@ -126,7 +144,7 @@ from sentinel_x_advanced import FederatedServer, DQNAgent
 
 # Immediate aggregation (default)
 server = FederatedServer()
-agents = [DQNAgent(state_dim=9, action_dim=4) for _ in range(5)]
+agents = [DQNAgent(state_dim=11, action_dim=4) for _ in range(5)]
 # ... train agents independently for one episode each ...
 server.aggregate(agents)   # all agents now share the same averaged weights
 
@@ -142,14 +160,15 @@ for _ in range(5):
 
 ## Multi-Agent Coordination
 
-`FederatedSwarm` extends the state vector with a **peer sensor deviation** feature (9th dimension). Before each time step, `_cross_check_sensors()` computes the deviation of each spacecraft's sensor reading from the swarm median. A spacecraft whose reading is an outlier receives a high `peer_sensor_deviation_norm` value, giving its DQN agent an additional signal to suspect a stuck-sensor fault.
+`FederatedSwarm` extends the state vector with a **peer sensor deviation** feature (11th dimension). Before each time step, `_cross_check_sensors()` computes the deviation of each spacecraft's sensor reading from the swarm median. A spacecraft whose reading is an outlier receives a high `peer_sensor_deviation_norm` value, giving its DQN agent an additional signal to suspect a stuck-sensor fault.
 
 ```
-State vector (FederatedSwarm):
+State vector (FederatedSwarm) - 11 features:
   [mem_error_ratio, parity_flag, sensor_deviation_norm,
    sensor_stuck_flag, time_since_recovery_norm, health_flag,
    thermal_fault_flag, power_level_norm,
-   peer_sensor_deviation_norm]   ← coordination feature
+   attitude_rate_norm, comm_quality_norm,
+   peer_sensor_deviation_norm]   <- coordination feature
 ```
 
 ---
@@ -159,15 +178,20 @@ State vector (FederatedSwarm):
 Convert any trained `DQNAgent` to TensorFlow Lite for deployment on embedded hardware (e.g., microcontrollers, CubeSat avionics):
 
 ```python
-from sentinel_x_advanced import export_tflite, DQNAgent
+from sentinel_x_advanced import export_tflite, export_tflite_int8, DQNAgent
 
-agent = DQNAgent(state_dim=9, action_dim=4)
+agent = DQNAgent(state_dim=11, action_dim=4)
 # ... train agent ...
+
+# Dynamic-range quantisation (float32 inference)
 export_tflite(agent, output_path="sentinel_x_model.tflite")
-# → TFLite model exported to 'sentinel_x_model.tflite' (8.9 KB)
+
+# Full integer-only quantisation for Cortex-M / STM32
+export_tflite_int8(agent, output_path="sentinel_x_model_int8.tflite")
 ```
 
-The converter applies dynamic-range weight quantisation (`tf.lite.Optimize.DEFAULT`), reducing the model footprint while preserving inference accuracy.
+`export_tflite()` applies dynamic-range weight quantisation (`tf.lite.Optimize.DEFAULT`).
+`export_tflite_int8()` performs full integer-only quantisation using a representative calibration dataset, producing integer-only arithmetic suitable for MCUs without FPUs.
 
 ---
 
@@ -184,7 +208,7 @@ The converter applies dynamic-range weight quantisation (`tf.lite.Optimize.DEFAU
 ```python
 from sentinel_x_advanced import PolicyVerifier, DQNAgent
 
-agent = DQNAgent(state_dim=9, action_dim=4)
+agent = DQNAgent(state_dim=11, action_dim=4)
 # ... train agent ...
 
 verifier = PolicyVerifier(agent, n_samples=500, margin_threshold=0.1)
@@ -201,6 +225,60 @@ report = verifier.verify()
 ```
 
 > **Note on certifiability**: The verifier uses probabilistic sampling over the normalised state space.  For flight-critical certification (e.g., DO-178C / ECSS standards) this lightweight check should be complemented by interval-arithmetic bounds or a dedicated neural-network verification tool such as α,β-CROWN or Marabou.
+
+---
+
+## Safety Monitor
+
+`SafetyMonitor` wraps any DQN agent with a rule-based FDIR veto layer enforcing hard safety constraints at inference time:
+
+```python
+from sentinel_x_advanced import SafetyMonitor
+import numpy as np
+
+monitor = SafetyMonitor()
+state = np.zeros(11, dtype=np.float32)
+state[5] = 1.0   # health_flag = faulted
+
+safe_action = monitor.veto(proposed_action, state, action_dim=4)
+# action 0 on faulted state -> forced to 3 (safe mode)
+# action 2 on critical-power state (state[7] < 0.15) -> forced to 3
+```
+
+---
+
+## Gossip-Based Federated Learning
+
+`GossipServer` provides a decentralised alternative to `FederatedServer` for large constellations:
+
+```python
+from sentinel_x_advanced import GossipServer, FederatedSwarm
+
+swarm = FederatedSwarm(num_spacecraft=10, action_dim=4, federated_interval=999)
+gossip = GossipServer(k=2, comm_delay_steps=3)
+
+for episode in range(200):
+    swarm.train_episode(max_steps=150)
+    if episode % 10 == 0:
+        gossip.gossip_round(swarm.agents)
+    gossip.tick(swarm.agents)
+```
+
+---
+
+## Adversarial Testing
+
+`AdversarialTester` uses FGSM to find minimal perturbations that flip the agent's greedy action:
+
+```python
+from sentinel_x_advanced import AdversarialTester
+
+tester = AdversarialTester(agent, epsilon=0.05)
+results = tester.find_adversarial_examples(n_examples=200)
+tester.summary(results, n_tested=200)
+```
+
+Adversarial examples can be injected back into the replay buffer for adversarial training.
 
 ---
 
