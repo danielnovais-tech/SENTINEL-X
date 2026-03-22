@@ -2718,3 +2718,122 @@ class TestDashboard:
             "formation_coordination.md"
         )
         assert os.path.isfile(path)
+
+
+# ===========================================================================
+# scripts/collect_hardware_perf.py tests
+# ===========================================================================
+
+class TestCollectHardwarePerf:
+    """Tests for the hardware performance data collection script."""
+
+    def _import_collector(self):
+        import importlib.util
+        path = os.path.join(os.path.dirname(__file__), "..",
+                            "scripts", "collect_hardware_perf.py")
+        spec = importlib.util.spec_from_file_location(
+            "collect_hardware_perf", path)
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        return mod
+
+    def test_script_exists(self):
+        path = os.path.join(os.path.dirname(__file__), "..",
+                            "scripts", "collect_hardware_perf.py")
+        assert os.path.isfile(path)
+
+    def test_pct_helper(self):
+        mod = self._import_collector()
+        times_ns = [int(x * 1e6) for x in [1.0, 2.0, 3.0, 4.0, 5.0]]
+        r = mod._pct(times_ns)
+        assert "p50_ms" in r and "p99_ms" in r and "mean_ms" in r
+        assert abs(r["p50_ms"] - 3.0) < 0.01
+
+    def test_main_simulation(self, tmp_path):
+        mod = self._import_collector()
+        json_out = str(tmp_path / "perf.json")
+        md_out   = str(tmp_path / "perf.md")
+        ret = mod.main([
+            "--timing-runs",    "10",
+            "--train-episodes", "2",
+            "--max-steps",      "10",
+            "--json-out",       json_out,
+            "--md-out",         md_out,
+            "--quiet",
+        ])
+        assert ret == 0
+        assert os.path.isfile(json_out)
+        assert os.path.isfile(md_out)
+
+        import json
+        data = json.loads(open(json_out).read())
+        assert "timing" in data
+        assert "rl"     in data
+        assert data["rl"]["train_episodes"] == 2
+        assert 0.0 <= data["rl"]["fault_recovery_rate"] <= 1.0
+
+    def test_md_report_contains_sections(self, tmp_path):
+        mod = self._import_collector()
+        json_out = str(tmp_path / "p.json")
+        md_out   = str(tmp_path / "p.md")
+        mod.main([
+            "--timing-runs", "5", "--train-episodes", "1",
+            "--max-steps",   "10",
+            "--json-out", json_out, "--md-out", md_out, "--quiet",
+        ])
+        md = open(md_out).read()
+        assert "Inference Pipeline Latency" in md
+        assert "Reinforcement Learning Performance" in md
+        assert "PASS" in md or "FAIL" in md
+        md = open(md_out).read()
+        assert "Inference Pipeline Latency" in md
+        assert "Reinforcement Learning Performance" in md
+        assert "PASS" in md or "FAIL" in md
+
+    def test_hardware_perf_results_doc_exists(self):
+        path = os.path.join(os.path.dirname(__file__), "..",
+                            "docs", "hardware_performance_results.md")
+        assert os.path.isfile(path)
+
+
+# ===========================================================================
+# Open-source artefact tests
+# ===========================================================================
+
+class TestOpenSourceArtefacts:
+    """Verify Apache 2.0 licence, CONTRIBUTING, CITATION, and technical report."""
+
+    def test_license_apache(self):
+        path = os.path.join(os.path.dirname(__file__), "..", "LICENSE")
+        assert os.path.isfile(path)
+        content = open(path).read()
+        assert "Apache License" in content
+        assert "Version 2.0" in content
+
+    def test_contributing_exists(self):
+        path = os.path.join(os.path.dirname(__file__), "..", "CONTRIBUTING.md")
+        assert os.path.isfile(path)
+        content = open(path).read()
+        assert "pull request" in content.lower() or "pull-request" in content.lower()
+
+    def test_citation_cff_exists(self):
+        path = os.path.join(os.path.dirname(__file__), "..", "CITATION.cff")
+        assert os.path.isfile(path)
+        content = open(path).read()
+        assert "cff-version" in content
+        assert "Apache-2.0" in content
+
+    def test_technical_report_exists(self):
+        path = os.path.join(os.path.dirname(__file__), "..",
+                            "docs", "technical_report.md")
+        assert os.path.isfile(path)
+        content = open(path).read()
+        assert "Abstract" in content
+        assert "Architecture" in content
+        assert "Verification" in content
+        assert "References" in content
+
+    def test_pyproject_license(self):
+        path = os.path.join(os.path.dirname(__file__), "..", "pyproject.toml")
+        content = open(path).read()
+        assert "Apache Software License" in content or "Apache-2.0" in content

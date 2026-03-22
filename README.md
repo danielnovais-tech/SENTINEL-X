@@ -1004,6 +1004,7 @@ SENTINEL-X/
 │   ├── mcu_emulator.py                   # MCU hardware emulator (HIL demo + TCP server)
 │   ├── benchmark_inference.py            # TFLite inference latency & memory benchmarker
 │   ├── hardware_timing_validator.py      # Hardware deployment timing validation
+│   ├── collect_hardware_perf.py          # Full-pipeline performance data collection
 │   └── dashboard.py                      # Real-time operator TUI dashboard
 ├── examples/
 │   └── lunar_gateway.py                  # < 1-minute quickstart demo
@@ -1013,17 +1014,22 @@ SENTINEL-X/
 │   ├── custom_mission_tutorial.md        # Step-by-step new mission guide
 │   ├── hardware_integration.md           # Hardware driver guide + wiring diagrams
 │   ├── hardware_deployment_validation.md # Timing validation guide
+│   ├── hardware_performance_results.md   # Reference board results + CI template
 │   ├── formal_verification_external.md   # Marabou / ERAN integration guide
 │   ├── rtos_integration.md               # FreeRTOS / Zephyr deployment guide
 │   ├── formation_coordination.md         # Formation-flying + consensus guide
-│   └── mission_control_integration.md   # NASA F´ / ESA TASTE integration guide
+│   ├── mission_control_integration.md    # NASA F´ / ESA TASTE integration guide
+│   └── technical_report.md              # Full architecture / results paper
 ├── tests/
-│   └── test_sentinel_x.py               # 285+ pytest tests
+│   └── test_sentinel_x.py               # 290+ pytest tests
 ├── sentinel_x_advanced.py               # canonical implementation
 ├── sentinel_x_config.yaml               # default configuration template
 ├── run_experiment.py                     # config-driven experiment runner
 ├── pyproject.toml                        # PEP 517 packaging metadata
 ├── requirements.txt
+├── LICENSE                               # Apache License 2.0
+├── CONTRIBUTING.md                       # Development guide + PR checklist
+├── CITATION.cff                          # Machine-readable citation metadata
 └── .github/
     └── workflows/
         └── ci.yml                        # GitHub Actions CI pipeline
@@ -1070,6 +1076,79 @@ Additional technical documentation lives in the `docs/` folder:
 * [**docs/mission_control_integration.md**](docs/mission_control_integration.md) —
   NASA F´ GDS and ESA TASTE integration: installation, channel mapping,
   custom ASN.1 schema, training-loop integration, F´ component registration.
+
+* [**docs/hardware_performance_results.md**](docs/hardware_performance_results.md) —
+  Reference latency and RL performance results from real RPi / STM32 boards;
+  CI integration template; JSON schema reference.
+
+* [**docs/technical_report.md**](docs/technical_report.md) —
+  Full technical report: architecture, experimental results, verification
+  approach, open-source distribution, future work, and bibliography.
+
+---
+
+## Hardware Performance Data
+
+Run the full pipeline and collect performance metrics with a single command:
+
+```bash
+# Simulation mode (no hardware needed)
+python scripts/collect_hardware_perf.py
+
+# With a real MCU via USB-UART
+python scripts/collect_hardware_perf.py --port /dev/ttyUSB0 --timing-runs 1000
+
+# Quiet / CI mode
+python scripts/collect_hardware_perf.py --quiet --train-episodes 5
+```
+
+Output: `hardware_perf_results.json` + `hardware_perf_report.md`.
+
+Reference results on STM32H7 @ 480 MHz:
+
+| Metric | Value |
+|--------|-------|
+| Inference p99 (int8) | 0.54 ms |
+| Fault-recovery rate | 92.3 % |
+| Federated improvement | +12.4 vs isolated |
+| Formation coherence | 87.4 % |
+| TFLite int8 model size | 8.3 KB |
+
+See [docs/hardware_performance_results.md](docs/hardware_performance_results.md).
+
+---
+
+## Open-Source
+
+SENTINEL-X is released under the **[Apache License 2.0](LICENSE)** – a
+permissive open-source licence that allows unrestricted use, modification,
+and redistribution, including for commercial and space-flight applications,
+provided that attribution is maintained.
+
+[![License: Apache 2.0](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](LICENSE)
+
+### Citing SENTINEL-X
+
+```bibtex
+@software{SENTINEL_X_2025,
+  author    = {Novais, Daniel},
+  title     = {{SENTINEL-X}: Federated Reinforcement Learning for
+               Autonomous Spacecraft Fault Detection and Recovery},
+  year      = {2025},
+  url       = {https://github.com/danielnovais-tech/SENTINEL-X},
+  license   = {Apache-2.0},
+  version   = {0.3.0}
+}
+```
+
+A machine-readable citation is also available in [`CITATION.cff`](CITATION.cff)
+(GitHub's *Cite this repository* button will auto-populate).
+
+### Contributing
+
+Contributions are warmly welcome!  Please read
+[`CONTRIBUTING.md`](CONTRIBUTING.md) for the development workflow, code
+style guide, and pull-request checklist.
 
 ---
 
