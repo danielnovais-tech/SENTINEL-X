@@ -770,6 +770,88 @@ for platform-specific build instructions.
 
 ---
 
+## Hardware Integration (Python Drivers)
+
+The `hardware/` package provides a three-layer bridge between the SENTINEL-X
+software pipeline and real embedded hardware:
+
+```python
+from hardware import create_hardware_interface, SpacecraftSensorInterface
+
+# Auto-detect or specify target: "rpi", "stm32", or "simulation"
+hw     = create_hardware_interface("rpi")
+sensor = SpacecraftSensorInterface(hw, filter_len=3)   # moving-average filter
+
+with hw:                              # open / close UART automatically
+    state  = sensor.read_state()     # normalised 11-dim state vector → agent
+    action = agent.act(state, explore=False)
+    hw.write_action(action)
+    hw.watchdog_ping()
+```
+
+The `SimulatedDriver` (default on non-Pi systems) requires no hardware and
+is used in CI. See
+[docs/hardware_integration.md](docs/hardware_integration.md) for wiring
+diagrams, UART frame format, and STM32 flash instructions.
+
+---
+
+## Formal Verification with External Tools
+
+`sentinel_x/formal_verification.py` provides **optional** integration with
+professional neural-network verifiers.  Both classes degrade gracefully to
+`ImportError` if the tool is not installed:
+
+```python
+from sentinel_x.formal_verification import (
+    export_to_onnx, MarabouVerifier, ERANVerifier, available_verifiers
+)
+print(available_verifiers())
+# {"marabou": False, "eran": False, "onnx_export": True}
+
+# Export to ONNX (requires onnx + tf2onnx)
+export_to_onnx(agent, "policy.onnx")
+
+# Complete formal proof with Marabou (requires maraboupy)
+verifier = MarabouVerifier("policy.onnx")
+report   = verifier.run_safety_suite(n_samples=100, epsilon=0.1)
+print(f"Verified: {report['verified']}/{report['total']}")
+
+# Robustness certification with ERAN (requires eran)
+eran_v = ERANVerifier("policy.onnx", domain="deeppoly")
+cert   = eran_v.certify_safe_actions(states, epsilon=0.05)
+```
+
+See [docs/formal_verification_external.md](docs/formal_verification_external.md)
+for installation instructions and a CI pipeline template.
+
+---
+
+## RTOS Integration (FreeRTOS / Zephyr)
+
+`hardware/freertos_task.c` is a complete FreeRTOS inference task for
+STM32H7 / Cortex-M MCUs:
+
+- Reads 22-byte UART sensor frames, builds the normalised state vector.
+- Runs the int8 TFLite Micro policy at **100 Hz** (~0.5–1 ms on STM32H7).
+- Applies hard `SafetyMonitor` vetoes (mirrors the Python implementation).
+- Transmits the chosen action back to the host.
+- Supports watchdog ping to prevent hardware reset.
+
+Flash it to your MCU:
+```bash
+# 1. Convert model to C array
+xxd -i sentinel_x_model_int8.tflite > sentinel_x_model_data.h
+
+# 2. Copy hardware/freertos_task.c + sentinel_x_model_data.h into your project
+# 3. Call SentinelX_CreateTask() from main() before vTaskStartScheduler()
+```
+
+Zephyr RTOS configuration and an equivalent Zephyr thread template are
+provided in [docs/rtos_integration.md](docs/rtos_integration.md).
+
+---
+
 ## Continuous Integration
 
 The repository includes a GitHub Actions CI workflow
@@ -789,30 +871,41 @@ python -m pytest tests/ -v
 
 ```
 SENTINEL-X/
-├── sentinel_x/                 # importable package (new in v0.3)
-│   ├── __init__.py             # re-exports full public API
-│   └── config.py               # YAML/JSON configuration loader
+├── sentinel_x/                       # importable package (new in v0.3)
+│   ├── __init__.py                   # re-exports full public API
+│   ├── config.py                     # YAML/JSON configuration loader
+│   └── formal_verification.py        # Optional Marabou / ERAN integration
+├── hardware/                         # Hardware Abstraction Layer
+│   ├── __init__.py                   # create_hardware_interface() factory
+│   ├── hal.py                        # Abstract base classes (HAL)
+│   ├── sensor_interfaces.py          # Sensor pre-processing layer
+│   ├── rpi_driver.py                 # Raspberry Pi GPIO + UART driver
+│   ├── stm32_driver.py               # STM32 / generic serial MCU driver
+│   └── freertos_task.c               # FreeRTOS inference task (C template)
 ├── scripts/
-│   ├── replay_tflite.py        # embedded deployment / latency benchmark
-│   ├── run_lunar_gateway.py    # full Lunar Gateway experiment cookbook
-│   ├── mcu_emulator.py         # MCU hardware emulator (HIL demo + TCP server)
-│   └── benchmark_inference.py  # TFLite inference latency & memory benchmarker
+│   ├── replay_tflite.py              # embedded deployment / latency benchmark
+│   ├── run_lunar_gateway.py          # full Lunar Gateway experiment cookbook
+│   ├── mcu_emulator.py               # MCU hardware emulator (HIL demo + TCP server)
+│   └── benchmark_inference.py        # TFLite inference latency & memory benchmarker
 ├── examples/
-│   └── lunar_gateway.py        # < 1-minute quickstart demo
+│   └── lunar_gateway.py              # < 1-minute quickstart demo
 ├── docs/
-│   ├── ltl_constraints.md              # How LTL Constraints Work
-│   ├── decision_tree_certification.md  # DT certification explainer
-│   └── custom_mission_tutorial.md      # Step-by-step new mission guide
+│   ├── ltl_constraints.md            # How LTL Constraints Work
+│   ├── decision_tree_certification.md # DT certification explainer
+│   ├── custom_mission_tutorial.md    # Step-by-step new mission guide
+│   ├── hardware_integration.md       # Hardware driver guide + wiring diagrams
+│   ├── formal_verification_external.md # Marabou / ERAN integration guide
+│   └── rtos_integration.md           # FreeRTOS / Zephyr deployment guide
 ├── tests/
-│   └── test_sentinel_x.py      # 209+ pytest tests
-├── sentinel_x_advanced.py      # canonical implementation
-├── sentinel_x_config.yaml      # default configuration template
-├── run_experiment.py           # config-driven experiment runner
-├── pyproject.toml              # PEP 517 packaging metadata
+│   └── test_sentinel_x.py            # 244+ pytest tests
+├── sentinel_x_advanced.py            # canonical implementation
+├── sentinel_x_config.yaml            # default configuration template
+├── run_experiment.py                 # config-driven experiment runner
+├── pyproject.toml                    # PEP 517 packaging metadata
 ├── requirements.txt
 └── .github/
     └── workflows/
-        └── ci.yml              # GitHub Actions CI pipeline
+        └── ci.yml                    # GitHub Actions CI pipeline
 ```
 
 ---
@@ -834,12 +927,24 @@ Additional technical documentation lives in the `docs/` folder:
   fully trained, verified, and exported policy in under 30 minutes (Jupiter
   flyby CubeSat worked example).
 
+* [**docs/hardware_integration.md**](docs/hardware_integration.md) —
+  Hardware driver guide: wiring diagrams, UART protocol, Raspberry Pi and
+  STM32 integration, step-by-step deployment checklist.
+
+* [**docs/formal_verification_external.md**](docs/formal_verification_external.md) —
+  Marabou and ERAN integration: installation, ONNX export, property
+  specification, batch certification, and CI pipeline example.
+
+* [**docs/rtos_integration.md**](docs/rtos_integration.md) —
+  FreeRTOS and Zephyr RTOS integration: build instructions, memory
+  requirements, expected latency, and deployment checklist.
+
 ---
 
 ## Testing
 
 ```bash
-# Run all 222 tests
+# Run all 245 tests
 python -m pytest tests/ -v
 
 # Run a specific test class
@@ -847,5 +952,8 @@ python -m pytest tests/ -k TestPPOAgent -v
 
 # Run config / package / deployment script tests only
 python -m pytest tests/ -k "TestPackage or TestConfig or TestReplayTFLite" -v
+
+# Run hardware and formal verification tests
+python -m pytest tests/ -k "TestHardwareHAL or TestFormalVerification" -v
 ```
 

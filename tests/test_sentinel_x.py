@@ -2073,3 +2073,248 @@ class TestBenchmarkInference:
             os.path.dirname(__file__), "..", "docs", "custom_mission_tutorial.md"
         )
         assert os.path.isfile(path)
+
+
+# ===========================================================================
+# hardware/ package tests (HAL, sensor interfaces, drivers)
+# ===========================================================================
+
+class TestHardwareHAL:
+    """Smoke tests for the hardware abstraction layer."""
+
+    def test_sensor_reading_to_state_vector_healthy(self):
+        from hardware.hal import SensorReading
+        r = SensorReading(
+            timestamp_s=0.0,
+            memory_error_count=0,
+            parity_error_flag=False,
+            sensor_deviation=0.0,
+            sensor_stuck=False,
+            time_since_recovery_s=0.0,
+            health_flag=False,
+            thermal_fault=False,
+            power_level_v=3.3,
+            attitude_rate_dps=0.0,
+            comm_quality_db=-60.0,
+        )
+        sv = r.to_state_vector()
+        assert len(sv) == 11
+        assert all(0.0 <= v <= 1.0 for v in sv), f"Out of range: {sv}"
+        # Healthy state: no faults → first two features near 0
+        assert sv[0] == 0.0   # memory errors = 0
+        assert sv[1] == 0.0   # parity flag = False
+
+    def test_sensor_reading_to_state_vector_fault(self):
+        from hardware.hal import SensorReading
+        r = SensorReading(
+            timestamp_s=1.0,
+            memory_error_count=5,
+            parity_error_flag=True,
+            sensor_deviation=5.0,
+            sensor_stuck=True,
+            time_since_recovery_s=100.0,
+            health_flag=True,
+            thermal_fault=True,
+            power_level_v=0.5,
+            attitude_rate_dps=90.0,
+            comm_quality_db=-100.0,
+        )
+        sv = r.to_state_vector()
+        assert sv[0] == 0.5   # 5/10 memory errors
+        assert sv[1] == 1.0   # parity flag
+        assert sv[3] == 1.0   # stuck flag
+        assert sv[5] == 1.0   # health flag
+        assert sv[6] == 1.0   # thermal fault
+
+    def test_sensor_reading_clips_out_of_range(self):
+        from hardware.hal import SensorReading
+        r = SensorReading(
+            timestamp_s=0.0,
+            memory_error_count=999,    # way over _MAX_MEMORY_ERRORS
+            power_level_v=100.0,       # way over _MAX_POWER_V
+        )
+        sv = r.to_state_vector()
+        assert sv[0] == 1.0   # clipped at 1.0
+        assert sv[7] == 1.0   # clipped at 1.0
+
+    def test_actuator_command_round_trip(self):
+        from hardware.hal import ActuatorCommand
+        for action in range(4):
+            cmd = ActuatorCommand(action_index=action)
+            data = cmd.to_bytes()
+            assert data[0] == 0xAA
+            assert data[1] == action
+            recovered = ActuatorCommand.from_bytes(data)
+            assert recovered.action_index == action
+
+    def test_actuator_command_labels(self):
+        from hardware.hal import ActuatorCommand
+        assert ActuatorCommand(0).action_label == "DO_NOTHING"
+        assert ActuatorCommand(1).action_label == "RESTART"
+        assert ActuatorCommand(2).action_label == "SWITCH_REDUNDANT"
+        assert ActuatorCommand(3).action_label == "SAFE_MODE"
+
+    def test_actuator_command_invalid_bytes(self):
+        from hardware.hal import ActuatorCommand
+        import pytest
+        with pytest.raises(ValueError):
+            ActuatorCommand.from_bytes(b"\xFF\x01")   # wrong header
+
+    def test_simulated_driver_round_trip(self):
+        from hardware.rpi_driver import SimulatedDriver
+        from hardware.hal import ActuatorCommand
+        drv = SimulatedDriver(fault_prob=0.0, seed=42)
+        with drv:
+            assert drv.is_connected()
+            reading = drv.read_sensors()
+            sv = reading.to_state_vector()
+            assert len(sv) == 11
+            cmd = ActuatorCommand(action_index=0)
+            drv.write_action(cmd)   # should not raise
+
+    def test_simulated_driver_fault_injection(self):
+        from hardware.rpi_driver import SimulatedDriver
+        drv = SimulatedDriver(fault_prob=1.0, seed=0)
+        with drv:
+            readings = [drv.read_sensors() for _ in range(20)]
+        # With fault_prob=1.0 at least some readings should have health issues
+        health_faults = sum(1 for r in readings if r.health_flag)
+        assert health_faults > 0, "Expected at least one health fault at fault_prob=1.0"
+
+    def test_spacecraft_sensor_interface_filter(self):
+        from hardware.rpi_driver import SimulatedDriver
+        from hardware.sensor_interfaces import SpacecraftSensorInterface
+        drv    = SimulatedDriver(fault_prob=0.0, seed=0)
+        sensor = SpacecraftSensorInterface(drv, filter_len=3)
+        with drv:
+            states = [sensor.read_state() for _ in range(10)]
+        assert len(states[0]) == 11
+        assert all(0.0 <= v <= 1.0 for state in states for v in state)
+
+    def test_spacecraft_sensor_interface_log(self):
+        from hardware.rpi_driver import SimulatedDriver
+        from hardware.sensor_interfaces import SpacecraftSensorInterface
+        drv    = SimulatedDriver(seed=1)
+        sensor = SpacecraftSensorInterface(drv, log_capacity=5)
+        with drv:
+            for _ in range(8):
+                sensor.read_state()
+        records = sensor.drain_log()
+        assert len(records) == 5   # ring buffer cap
+        assert "ts" in records[0]
+        assert "raw" in records[0]
+        assert "filtered" in records[0]
+
+    def test_create_hardware_interface_simulation(self):
+        from hardware import create_hardware_interface
+        hw = create_hardware_interface("simulation")
+        assert hw is not None
+        with hw:
+            assert hw.is_connected()
+
+    def test_create_hardware_interface_invalid(self):
+        from hardware import create_hardware_interface
+        import pytest
+        with pytest.raises(ValueError, match="Unknown target"):
+            create_hardware_interface("quantum_computer")
+
+    def test_hardware_docs_exist(self):
+        path = os.path.join(
+            os.path.dirname(__file__), "..", "docs", "hardware_integration.md"
+        )
+        assert os.path.isfile(path)
+
+    def test_rtos_docs_exist(self):
+        path = os.path.join(
+            os.path.dirname(__file__), "..", "docs", "rtos_integration.md"
+        )
+        assert os.path.isfile(path)
+
+    def test_freertos_task_c_exists(self):
+        path = os.path.join(
+            os.path.dirname(__file__), "..", "hardware", "freertos_task.c"
+        )
+        assert os.path.isfile(path)
+
+
+# ===========================================================================
+# sentinel_x/formal_verification.py tests
+# ===========================================================================
+
+class TestFormalVerification:
+    """Tests for the optional Marabou/ERAN integration module."""
+
+    def _import_fv(self):
+        from sentinel_x import formal_verification as fv
+        return fv
+
+    def test_module_imports(self):
+        fv = self._import_fv()
+        assert hasattr(fv, "MarabouVerifier")
+        assert hasattr(fv, "ERANVerifier")
+        assert hasattr(fv, "export_to_onnx")
+        assert hasattr(fv, "available_verifiers")
+
+    def test_available_verifiers_returns_dict(self):
+        fv = self._import_fv()
+        avail = fv.available_verifiers()
+        assert isinstance(avail, dict)
+        assert "marabou" in avail
+        assert "eran" in avail
+        assert "onnx_export" in avail
+        # All values must be bool
+        for k, v in avail.items():
+            assert isinstance(v, bool), f"{k} should be bool, got {type(v)}"
+
+    def test_sentinel_x_package_exports_fv(self):
+        """formal_verification symbols must be importable from the package."""
+        import sentinel_x as sx
+        assert hasattr(sx, "available_verifiers")
+        assert hasattr(sx, "MarabouVerifier")
+        assert hasattr(sx, "ERANVerifier")
+        assert hasattr(sx, "export_to_onnx")
+
+    def test_marabou_verifier_raises_import_error_when_not_installed(self):
+        """If maraboupy is not installed, constructor raises ImportError."""
+        fv = self._import_fv()
+        if fv._HAS_MARABOU:
+            import pytest
+            pytest.skip("Marabou is installed – skipping absence test")
+        import pytest
+        with pytest.raises(ImportError, match="[Mm]arabou"):
+            fv.MarabouVerifier("nonexistent.onnx")
+
+    def test_eran_verifier_raises_import_error_when_not_installed(self):
+        fv = self._import_fv()
+        if fv._HAS_ERAN:
+            import pytest
+            pytest.skip("ERAN is installed – skipping absence test")
+        import pytest
+        with pytest.raises(ImportError, match="[Ee][Rr][Aa][Nn]"):
+            fv.ERANVerifier("nonexistent.onnx")
+
+    def test_export_to_onnx_raises_import_error_when_not_installed(self):
+        fv = self._import_fv()
+        if fv._HAS_ONNX:
+            import pytest
+            pytest.skip("onnx is installed – skipping absence test")
+        import pytest
+        with pytest.raises(ImportError, match="[Oo][Nn][Nn][Xx]"):
+            fv.export_to_onnx(None, "test.onnx")
+
+    def test_marabou_verifier_raises_file_not_found_when_marabou_installed(self):
+        """If Marabou is installed but file missing → FileNotFoundError."""
+        fv = self._import_fv()
+        if not fv._HAS_MARABOU:
+            import pytest
+            pytest.skip("Marabou not installed")
+        import pytest
+        with pytest.raises(FileNotFoundError):
+            fv.MarabouVerifier("/nonexistent/path/model.onnx")
+
+    def test_formal_verification_docs_exist(self):
+        path = os.path.join(
+            os.path.dirname(__file__), "..", "docs",
+            "formal_verification_external.md"
+        )
+        assert os.path.isfile(path)

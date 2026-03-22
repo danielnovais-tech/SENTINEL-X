@@ -35,6 +35,10 @@ Training utilities
 Safety & verification
     SafetyMonitor, PolicyVerifier, AdversarialTester
 
+Formal verification (external tools – optional)
+    MarabouVerifier, ERANVerifier, export_to_onnx, available_verifiers
+    (requires ``maraboupy``/``eran`` + ``onnx tf2onnx``; graceful fallback)
+
 Deployment
     export_tflite, export_tflite_int8, extract_decision_tree
     export_decision_tree_rules, dt_fidelity_report
@@ -126,4 +130,19 @@ __all__ = [
     # Configuration
     "load_config",
     "save_default_config",
+    # Formal verification (external tools – optional)
+    "MarabouVerifier",
+    "ERANVerifier",
+    "export_to_onnx",
+    "available_verifiers",
 ]
+
+# ---------------------------------------------------------------------------
+# Optional: formal verification module (lazy import – never fails on import)
+# ---------------------------------------------------------------------------
+from sentinel_x.formal_verification import (  # noqa: F401, E402
+    MarabouVerifier,
+    ERANVerifier,
+    export_to_onnx,
+    available_verifiers,
+)
