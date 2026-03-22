@@ -1863,3 +1863,213 @@ class TestExamplesLunarGateway:
             os.path.dirname(__file__), "..", "examples", "lunar_gateway.py"
         )
         assert os.path.isfile(path), "examples/lunar_gateway.py is missing"
+
+
+# ===========================================================================
+# scripts/mcu_emulator.py tests
+# ===========================================================================
+
+class TestMcuEmulator:
+    """Smoke tests for the MCU hardware emulator script."""
+
+    def _import_emulator(self):
+        import importlib.util
+        spec = importlib.util.spec_from_file_location(
+            "mcu_emulator",
+            os.path.join(os.path.dirname(__file__), "..", "scripts", "mcu_emulator.py"),
+        )
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        return mod
+
+    def test_module_imports(self):
+        mod = self._import_emulator()
+        assert hasattr(mod, "run_demo")
+        assert hasattr(mod, "run_server")
+        assert hasattr(mod, "run_client")
+
+    def test_fault_scenarios_not_empty(self):
+        mod = self._import_emulator()
+        assert len(mod._FAULT_SCENARIOS) >= 8
+        for name, state in mod._FAULT_SCENARIOS:
+            assert isinstance(name, str)
+            assert state.shape == (mod._STATE_DIM,)
+
+    def test_apply_safety_veto_inaction_on_fault(self):
+        mod = self._import_emulator()
+        import numpy as np
+        # health_flag (index 5) = 1.0 → veto action=0 → should become SAFE_MODE
+        state = np.zeros(mod._STATE_DIM, dtype=np.float32)
+        state[5] = 1.0   # health fault active
+        state[7] = 0.8   # power OK
+        action, vetoed = mod._apply_safety_veto(0, state)
+        assert vetoed is True
+        assert action == 3  # SAFE_MODE
+
+    def test_apply_safety_veto_low_power_reset(self):
+        mod = self._import_emulator()
+        import numpy as np
+        state = np.zeros(mod._STATE_DIM, dtype=np.float32)
+        state[5] = 0.0   # no health fault
+        state[7] = 0.08  # critically low power
+        action, vetoed = mod._apply_safety_veto(2, state)  # SWITCH_REDUNDANT
+        assert vetoed is True
+        assert action == 3  # SAFE_MODE
+
+    def test_apply_safety_veto_no_veto_needed(self):
+        mod = self._import_emulator()
+        import numpy as np
+        state = np.zeros(mod._STATE_DIM, dtype=np.float32)
+        state[5] = 0.0   # healthy
+        state[7] = 0.9   # plenty of power
+        action, vetoed = mod._apply_safety_veto(0, state)
+        assert vetoed is False
+        assert action == 0
+
+    def test_mcu_emulator_demo_writes_csv_log(self):
+        """Demo mode writes a CSV log."""
+        import tempfile
+        mod = self._import_emulator()
+
+        # We need a real TFLite model for this test
+        swarm = sx.FederatedSwarm(
+            num_spacecraft=2, action_dim=4,
+            mission_profile=sx.MissionProfile(sx.MissionProfile.BALANCED),
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            model_path = os.path.join(tmp, "test_model_int8.tflite")
+            sx.export_tflite_int8(swarm.agents[0], output_path=model_path, n_calib_samples=8)
+            log_path = os.path.join(tmp, "test_log.csv")
+
+            class _Args:
+                model = model_path
+                mcu_latency_ms = 1.5
+                steps = 4
+                log_file = log_path
+
+            mod.run_demo(_Args())
+            assert os.path.isfile(log_path)
+            with open(log_path, encoding="utf-8") as f:
+                content = f.read()
+            assert "step" in content
+            assert "action" in content
+
+    def test_script_file_exists(self):
+        path = os.path.join(
+            os.path.dirname(__file__), "..", "scripts", "mcu_emulator.py"
+        )
+        assert os.path.isfile(path)
+
+
+# ===========================================================================
+# scripts/benchmark_inference.py tests
+# ===========================================================================
+
+class TestBenchmarkInference:
+    """Smoke tests for the TFLite inference benchmarker."""
+
+    def _import_benchmarker(self):
+        import importlib.util
+        spec = importlib.util.spec_from_file_location(
+            "benchmark_inference",
+            os.path.join(os.path.dirname(__file__), "..", "scripts", "benchmark_inference.py"),
+        )
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        return mod
+
+    def test_module_imports(self):
+        mod = self._import_benchmarker()
+        assert hasattr(mod, "_benchmark")
+        assert hasattr(mod, "_load_interpreter")
+        assert hasattr(mod, "_run_one")
+
+    def test_benchmark_returns_report(self):
+        import tempfile
+        import numpy as np
+        mod = self._import_benchmarker()
+
+        swarm = sx.FederatedSwarm(
+            num_spacecraft=2, action_dim=4,
+            mission_profile=sx.MissionProfile(sx.MissionProfile.BALANCED),
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            model_path = os.path.join(tmp, "bench_int8.tflite")
+            sx.export_tflite_int8(swarm.agents[0], output_path=model_path, n_calib_samples=8)
+
+            rng    = np.random.default_rng(0)
+            report = mod._benchmark(model_path, warmup=5, runs=20, rng=rng, quiet=True)
+
+        assert report["timed_runs"] == 20
+        assert report["warmup_runs"] == 5
+        assert "latency_ms" in report
+        lat = report["latency_ms"]
+        assert lat["min"] <= lat["p50"] <= lat["max"]
+        assert lat["mean"] > 0.0
+        assert report["throughput_ips"] > 0
+        assert report["model_size_bytes"] > 0
+        assert "action_distribution" in report
+
+    def test_report_keys_complete(self):
+        import tempfile
+        import numpy as np
+        mod = self._import_benchmarker()
+
+        swarm = sx.FederatedSwarm(
+            num_spacecraft=2, action_dim=4,
+            mission_profile=sx.MissionProfile(sx.MissionProfile.BALANCED),
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            model_path = os.path.join(tmp, "bench_dyn.tflite")
+            sx.export_tflite(swarm.agents[0], output_path=model_path)
+
+            rng    = np.random.default_rng(1)
+            report = mod._benchmark(model_path, warmup=3, runs=10, rng=rng, quiet=True)
+
+        required_keys = [
+            "model", "warmup_runs", "timed_runs", "device",
+            "latency_ms", "throughput_ips", "peak_rss_mb",
+            "model_size_bytes", "action_distribution",
+        ]
+        for k in required_keys:
+            assert k in report, f"Missing key: {k}"
+
+        lat_keys = ["min", "p5", "p25", "p50", "p75", "p95", "p99", "max", "mean", "std"]
+        for k in lat_keys:
+            assert k in report["latency_ms"], f"Missing latency key: {k}"
+
+    def test_json_output_written(self):
+        import tempfile
+        import json as _json
+        import numpy as np
+        mod = self._import_benchmarker()
+
+        swarm = sx.FederatedSwarm(
+            num_spacecraft=2, action_dim=4,
+            mission_profile=sx.MissionProfile(sx.MissionProfile.BALANCED),
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            model_path  = os.path.join(tmp, "bench_out_int8.tflite")
+            output_path = os.path.join(tmp, "report.json")
+            sx.export_tflite_int8(swarm.agents[0], output_path=model_path, n_calib_samples=8)
+
+            rng    = np.random.default_rng(2)
+            report = mod._benchmark(model_path, warmup=3, runs=10, rng=rng, quiet=True)
+            from pathlib import Path
+            Path(output_path).write_text(_json.dumps(report, indent=2), encoding="utf-8")
+
+            assert os.path.isfile(output_path)
+            loaded = _json.loads(Path(output_path).read_text())
+            assert loaded["timed_runs"] == 10
+
+    def test_script_file_exists(self):
+        path = os.path.join(
+            os.path.dirname(__file__), "..", "scripts", "benchmark_inference.py"
+        )
+        assert os.path.isfile(path)
+
+    def test_docs_custom_mission_exists(self):
+        path = os.path.join(
+            os.path.dirname(__file__), "..", "docs", "custom_mission_tutorial.md"
+        )
+        assert os.path.isfile(path)
