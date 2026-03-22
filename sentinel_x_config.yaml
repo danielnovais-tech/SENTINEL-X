@@ -55,6 +55,11 @@ curiosity:
   bonus_scale: 0.1  # peak novelty bonus magnitude
   clip: 1.0         # hard upper bound on bonus
 
+# ── LTL constrained-RL reward shaping ──────────────────────────────────────
+ltl:
+  enabled: false    # set to true to activate LTL penalties in FederatedSwarm
+  penalty: -0.5     # reward deduction applied per violated LTL constraint per step
+
 # ── PPO agent ──────────────────────────────────────────────────────────────
 ppo:
   lr: 0.0003

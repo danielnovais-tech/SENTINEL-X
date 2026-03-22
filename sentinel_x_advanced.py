@@ -1201,6 +1201,7 @@ class FederatedSwarm(Swarm):
         link_dropout_prob: float = 0.0,
         safety_monitor: "SafetyMonitor" = None,
         cooperative_bonus: float = 0.0,
+        ltl_checker: "LTLConstraintChecker" = None,
     ):
         """
         Parameters
@@ -1232,6 +1233,13 @@ class FederatedSwarm(Swarm):
             one spacecraft is unhealthy, creating a cooperative MARL incentive
             for the swarm to keep *all* members operational.  Set to ``0.0``
             (default) to disable cooperative rewards.
+        ltl_checker : LTLConstraintChecker, optional
+            When provided, the penalty returned by
+            ``LTLConstraintChecker.evaluate(state, action)`` is added to the
+            mission reward at every training step, implementing constrained RL.
+            The total LTL penalty incurred during the last episode is
+            accumulated in ``self.last_ltl_penalty``.  Set to ``None``
+            (default) to disable LTL shaping.
         """
         super().__init__(num_spacecraft, self.COORD_STATE_DIM, action_dim)
         self.server = FederatedServer(
@@ -1242,8 +1250,10 @@ class FederatedSwarm(Swarm):
         self.federated_interval = federated_interval
         self.safety_monitor = safety_monitor
         self.cooperative_bonus = float(cooperative_bonus)
+        self.ltl_checker = ltl_checker
         self._episode_count = 0
         self.last_override_count = 0   # overrides triggered in last train_episode
+        self.last_ltl_penalty = 0.0    # cumulative LTL penalty in last train_episode
         for sc in self.spacecraft:
             sc._peer_sensor_deviation = 0.0
 
@@ -1306,6 +1316,7 @@ class FederatedSwarm(Swarm):
 
         episode_rewards = [0.0] * len(self.spacecraft)
         override_count = 0
+        ltl_penalty_total = 0.0
 
         for step in range(max_steps):
             # Observe coordinated states (pre-step cross-check)
@@ -1360,6 +1371,11 @@ class FederatedSwarm(Swarm):
                         if all_healthy_now
                         else -0.25 * self.cooperative_bonus
                     )
+                # LTL constrained-RL penalty (applied to the vetoed action)
+                if self.ltl_checker is not None:
+                    ltl_pen = self.ltl_checker.evaluate(states[i], actions[i])
+                    reward += ltl_pen
+                    ltl_penalty_total += ltl_pen
                 episode_rewards[i] += reward
                 done = step == max_steps - 1
                 # Store the vetoed (safe) action so the agent learns to
@@ -1373,6 +1389,7 @@ class FederatedSwarm(Swarm):
 
         self._episode_count += 1
         self.last_override_count = override_count
+        self.last_ltl_penalty = ltl_penalty_total
         if self._episode_count % self.federated_interval == 0:
             self.server.aggregate(self.agents)
 
@@ -1734,17 +1751,44 @@ class SafetyMonitor:
 
     This architecture mirrors the hybrid RL + FDIR layer recommended for
     space-qualified autonomy under ECSS-E-ST-70-11 and NASA autonomy standards.
+
+    Parameters
+    ----------
+    dt_fallback : DecisionTreeClassifier, optional
+        A decision-tree surrogate (produced by :func:`extract_decision_tree`)
+        used as a *secondary* policy when no hard constraint is triggered.
+        If ``None`` (default) the proposed DQN action is returned unmodified
+        (after hard-constraint checks).  When provided, actions that pass
+        the hard-constraint checks are further validated by the tree: if the
+        tree recommends a *different* action, the monitor still returns the
+        DQN's vetoed-safe action unless the DQN proposed action 0 ("do
+        nothing") on a non-faulted state AND the tree recommends a recovery
+        action, in which case the tree's recommendation is used as a
+        proactive safety nudge.
     """
 
     HEALTH_FLAG_IDX = Spacecraft.HEALTH_FLAG_IDX   # 5
     POWER_LEVEL_IDX = 7
     CRITICAL_POWER_THRESHOLD = 0.15
 
+    def __init__(self, dt_fallback=None):
+        """
+        Parameters
+        ----------
+        dt_fallback : DecisionTreeClassifier or None
+            Optional decision-tree surrogate used as a secondary policy for
+            proactive safety nudges (see class docstring).
+        """
+        self.dt_fallback = dt_fallback
+
     def veto(self, proposed_action: int, state: np.ndarray, action_dim: int) -> int:
         """
         Apply hard safety constraints and return a safe action.
 
         Returns ``proposed_action`` unchanged if no constraint is violated.
+        When a ``dt_fallback`` tree is configured, a proactive nudge is applied
+        on healthy states where the DQN recommends inaction but the tree
+        recommends a recovery action.
 
         Parameters
         ----------
@@ -1774,6 +1818,23 @@ class SafetyMonitor:
         # Constraint 2: no full hardware reset on critically low power
         if proposed_action == 2 and power_level < self.CRITICAL_POWER_THRESHOLD:
             return 3   # safe mode instead
+
+        # Optional DT-guided proactive nudge (healthy state, DQN says "do nothing")
+        if (
+            self.dt_fallback is not None
+            and proposed_action == 0
+            and health_flag < 0.5
+        ):
+            try:
+                dt_action = int(
+                    self.dt_fallback.predict(
+                        np.array(state, dtype=np.float32)[np.newaxis, :]
+                    )[0]
+                )
+                if dt_action != 0:
+                    return dt_action
+            except Exception:
+                pass   # malformed state or sklearn not available → ignore
 
         return proposed_action
 
@@ -2309,9 +2370,180 @@ def extract_decision_tree(
     return dt
 
 
-# -----------------------------------------------------------------------
-# 15. Mission Scenarios
-# -----------------------------------------------------------------------
+def export_decision_tree_rules(
+    dt,
+    feature_names: list = None,
+    action_names: list = None,
+    indent: str = "  ",
+) -> str:
+    """
+    Export a decision-tree surrogate as a human-readable if-then-else rule set.
+
+    The resulting text can be reviewed by a safety engineer, copy-pasted into
+    a formal specification tool, or used as the starting point for an SMT
+    encoding.  Each leaf prints the predicted action and the fraction of
+    training samples that fell in that leaf (a proxy for confidence).
+
+    Parameters
+    ----------
+    dt : DecisionTreeClassifier
+        Fitted scikit-learn decision tree (e.g., from :func:`extract_decision_tree`).
+    feature_names : list of str, optional
+        Names for each state dimension.  Defaults to ``["f0", "f1", …]``.
+    action_names : list of str, optional
+        Human-readable labels for each action index.
+        Defaults to ``["DO_NOTHING", "RESTART", "SWITCH_REDUNDANT", "SAFE_MODE"]``.
+    indent : str
+        Indentation string per tree level (default ``"  "``).
+
+    Returns
+    -------
+    str
+        Multi-line if-then-else rule string.
+
+    Raises
+    ------
+    ImportError
+        If scikit-learn is not installed.
+    """
+    if not _SKLEARN_AVAILABLE:
+        raise ImportError(
+            "scikit-learn is required for decision-tree rule export. "
+            "Install it with: pip install scikit-learn"
+        )
+    n_features = dt.n_features_in_
+    if feature_names is None:
+        feature_names = [f"f{i}" for i in range(n_features)]
+    if action_names is None:
+        action_names = ["DO_NOTHING", "RESTART", "SWITCH_REDUNDANT", "SAFE_MODE"]
+
+    tree_ = dt.tree_
+    lines: list = []
+
+    def _recurse(node: int, depth: int) -> None:
+        pad = indent * depth
+        if tree_.feature[node] != -2:   # -2 == TREE_UNDEFINED (leaf marker)
+            feat = feature_names[tree_.feature[node]]
+            thresh = tree_.threshold[node]
+            lines.append(f"{pad}if {feat} <= {thresh:.6f}:")
+            _recurse(tree_.children_left[node], depth + 1)
+            lines.append(f"{pad}else:  # {feat} > {thresh:.6f}")
+            _recurse(tree_.children_right[node], depth + 1)
+        else:
+            # Leaf: pick the class with the highest sample count
+            class_idx = int(np.argmax(tree_.value[node]))
+            n_node = int(tree_.n_node_samples[node])
+            n_total = int(tree_.n_node_samples[0])
+            coverage = n_node / n_total if n_total > 0 else 0.0
+            label = (
+                action_names[class_idx]
+                if class_idx < len(action_names)
+                else str(class_idx)
+            )
+            lines.append(
+                f"{pad}return {label}  "
+                f"# action={class_idx}, coverage={coverage:.1%}"
+            )
+
+    _recurse(0, 0)
+    return "\n".join(lines)
+
+
+def dt_fidelity_report(
+    agent: "DQNAgent",
+    dt,
+    n_eval: int = 1000,
+    rng_seed: int = 0,
+) -> dict:
+    """
+    Compare decision-tree surrogate against the DQN greedy policy.
+
+    Evaluates both policies on a held-out set of random states, reporting
+    agreement (fidelity), per-action confusion, and action-match rate.  The
+    results help gauge whether the tree is a faithful substitute for the DQN
+    and where they disagree most.
+
+    Parameters
+    ----------
+    agent : DQNAgent
+        The reference DQN agent.
+    dt : DecisionTreeClassifier
+        Fitted decision-tree surrogate.
+    n_eval : int
+        Number of random states to evaluate on (default 1000).
+    rng_seed : int
+        Reproducibility seed.
+
+    Returns
+    -------
+    dict with keys:
+
+    * ``fidelity`` (float) – Fraction of states where DT matches DQN.
+    * ``action_match_counts`` (dict) – Per-action count of agreements.
+    * ``action_total_counts`` (dict) – Per-action total DQN label count.
+    * ``per_action_fidelity`` (dict) – Per-action agreement rate.
+    * ``n_eval`` (int) – Number of states evaluated.
+
+    Raises
+    ------
+    ImportError
+        If scikit-learn is not installed.
+    """
+    if not _SKLEARN_AVAILABLE:
+        raise ImportError(
+            "scikit-learn is required for DT fidelity evaluation. "
+            "Install it with: pip install scikit-learn"
+        )
+    rng = np.random.default_rng(rng_seed)
+    states = rng.uniform(0.0, 1.0, size=(n_eval, agent.state_dim)).astype(np.float32)
+
+    # DQN greedy labels
+    q_vals = agent.model.predict(states, verbose=0)
+    dqn_labels = np.argmax(q_vals, axis=1)
+
+    # DT predictions
+    dt_labels = dt.predict(states)
+
+    # Global fidelity
+    fidelity = float(np.mean(dqn_labels == dt_labels))
+
+    # Per-action breakdown
+    action_match_counts: dict = {}
+    action_total_counts: dict = {}
+    for a in range(agent.action_dim):
+        mask = dqn_labels == a
+        action_total_counts[a] = int(np.sum(mask))
+        action_match_counts[a] = int(np.sum(dt_labels[mask] == a)) if mask.any() else 0
+
+    per_action_fidelity = {
+        a: (action_match_counts[a] / action_total_counts[a])
+        if action_total_counts[a] > 0 else float("nan")
+        for a in range(agent.action_dim)
+    }
+
+    print(
+        f"DT fidelity report  (n={n_eval}, tree depth={dt.get_depth()}, "
+        f"leaves={dt.get_n_leaves()})"
+    )
+    print(f"  Overall fidelity   : {fidelity * 100:.1f}%")
+    action_labels = ["DO_NOTHING", "RESTART", "SWITCH_REDUNDANT", "SAFE_MODE"]
+    for a in range(agent.action_dim):
+        label = action_labels[a] if a < len(action_labels) else str(a)
+        pf = per_action_fidelity[a]
+        pf_str = f"{pf * 100:.1f}%" if pf == pf else "n/a"
+        print(
+            f"  {label:<22}: "
+            f"{action_match_counts[a]:>4}/{action_total_counts[a]:<4} "
+            f"matched  ({pf_str})"
+        )
+
+    return {
+        "fidelity": fidelity,
+        "action_match_counts": action_match_counts,
+        "action_total_counts": action_total_counts,
+        "per_action_fidelity": per_action_fidelity,
+        "n_eval": n_eval,
+    }
 
 class MissionScenario:
     """
@@ -2487,6 +2719,7 @@ def build_swarm_for_scenario(
     federated_interval: int = 10,
     safety_monitor: "SafetyMonitor" = None,
     cooperative_bonus: float = 0.0,
+    ltl_checker: "LTLConstraintChecker" = None,
 ) -> "FederatedSwarm":
     """
     Construct a ``FederatedSwarm`` configured for *scenario*.
@@ -2510,6 +2743,9 @@ def build_swarm_for_scenario(
     cooperative_bonus : float
         Per-step team reward when all spacecraft are healthy (see
         ``FederatedSwarm.cooperative_bonus``).  Default ``0.0`` disables it.
+    ltl_checker : LTLConstraintChecker, optional
+        Constrained-RL penalty layer.  When provided, LTL violation penalties
+        are added to the mission reward at every training step.
 
     Returns
     -------
@@ -2525,6 +2761,7 @@ def build_swarm_for_scenario(
         link_dropout_prob=scenario.link_dropout_prob,
         safety_monitor=safety_monitor,
         cooperative_bonus=cooperative_bonus,
+        ltl_checker=ltl_checker,
     )
     # Replace each spacecraft with a scenario-configured instance so that
     # fault parameters persist across reset() calls between episodes.

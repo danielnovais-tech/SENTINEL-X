@@ -105,6 +105,11 @@ _DEFAULT_CONFIG: dict = {
         "bonus_scale": 0.1,
         "clip": 1.0,
     },
+    "ltl": {
+        # Set enabled=true to activate LTL constrained-RL penalty in FederatedSwarm
+        "enabled": False,
+        "penalty": -0.5,       # reward deduction per violated constraint per step
+    },
     "ppo": {
         "lr": 3e-4,
         "gamma": 0.99,

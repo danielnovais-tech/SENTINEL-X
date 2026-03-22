@@ -37,6 +37,7 @@ Safety & verification
 
 Deployment
     export_tflite, export_tflite_int8, extract_decision_tree
+    export_decision_tree_rules, dt_fidelity_report
     benchmark_federation, run_do_nothing_baseline
 """
 
@@ -75,6 +76,8 @@ from sentinel_x_advanced import (  # noqa: F401
     export_tflite,
     export_tflite_int8,
     extract_decision_tree,
+    export_decision_tree_rules,
+    dt_fidelity_report,
     benchmark_federation,
     run_do_nothing_baseline,
 )
@@ -116,6 +119,8 @@ __all__ = [
     "export_tflite",
     "export_tflite_int8",
     "extract_decision_tree",
+    "export_decision_tree_rules",
+    "dt_fidelity_report",
     "benchmark_federation",
     "run_do_nothing_baseline",
     # Configuration

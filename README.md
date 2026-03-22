@@ -673,7 +673,7 @@ SENTINEL-X/
 ├── scripts/
 │   └── replay_tflite.py        # embedded deployment / latency benchmark
 ├── tests/
-│   └── test_sentinel_x.py      # 163 pytest tests
+│   └── test_sentinel_x.py      # 196 pytest tests
 ├── sentinel_x_advanced.py      # canonical implementation
 ├── sentinel_x_config.yaml      # default configuration template
 ├── pyproject.toml              # PEP 517 packaging metadata
@@ -688,7 +688,7 @@ SENTINEL-X/
 ## Testing
 
 ```bash
-# Run all 163 tests
+# Run all 196 tests
 python -m pytest tests/ -v
 
 # Run a specific test class

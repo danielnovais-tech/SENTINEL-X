@@ -1343,3 +1343,351 @@ class TestReplayTFLite:
                 _load_scenario(fname)
         finally:
             os.unlink(fname)
+
+
+# ===========================================================================
+# New feature tests (items 1a, 1b, 1c)
+# ===========================================================================
+
+# ---------------------------------------------------------------------------
+# 1a) LTL integration into FederatedSwarm
+# ---------------------------------------------------------------------------
+
+class TestFederatedSwarmLTL:
+    """LTL constrained-RL penalty integration in FederatedSwarm."""
+
+    def _make_swarm(self, ltl_checker=None):
+        return sx.FederatedSwarm(
+            num_spacecraft=2,
+            action_dim=4,
+            mission_profile=sx.MissionProfile(sx.MissionProfile.BALANCED),
+            federated_interval=5,
+            ltl_checker=ltl_checker,
+        )
+
+    def test_ltl_checker_none_by_default(self):
+        swarm = self._make_swarm()
+        assert swarm.ltl_checker is None
+
+    def test_ltl_checker_stored(self):
+        ltl = sx.LTLConstraintChecker(penalty=-0.5)
+        swarm = self._make_swarm(ltl_checker=ltl)
+        assert swarm.ltl_checker is ltl
+
+    def test_last_ltl_penalty_zero_without_checker(self):
+        swarm = self._make_swarm()
+        swarm.train_episode(max_steps=10)
+        assert swarm.last_ltl_penalty == pytest.approx(0.0)
+
+    def test_last_ltl_penalty_nonpositive_with_checker(self):
+        """With LTL enabled, cumulative penalty must be ≤ 0."""
+        ltl = sx.LTLConstraintChecker(penalty=-1.0)
+        swarm = self._make_swarm(ltl_checker=ltl)
+        swarm.train_episode(max_steps=20)
+        assert swarm.last_ltl_penalty <= 0.0
+
+    def test_train_episode_returns_float_with_ltl(self):
+        ltl = sx.LTLConstraintChecker(penalty=-0.5)
+        swarm = self._make_swarm(ltl_checker=ltl)
+        result = swarm.train_episode(max_steps=10)
+        assert isinstance(result, float)
+
+    def test_build_swarm_for_scenario_passes_ltl(self):
+        scenario = sx.MissionScenario.lunar_gateway()
+        ltl = sx.LTLConstraintChecker(penalty=-0.5)
+        swarm = sx.build_swarm_for_scenario(
+            scenario, ltl_checker=ltl
+        )
+        assert swarm.ltl_checker is ltl
+
+    def test_ltl_penalty_lower_than_without(self):
+        """Episode reward WITH penalty should differ from WITHOUT."""
+        import random as _random
+        _random.seed(0)
+        np.random.seed(0)
+
+        swarm_no_ltl = sx.FederatedSwarm(
+            num_spacecraft=2,
+            action_dim=4,
+            mission_profile=sx.MissionProfile(sx.MissionProfile.BALANCED),
+            federated_interval=999,
+        )
+        swarm_ltl = sx.FederatedSwarm(
+            num_spacecraft=2,
+            action_dim=4,
+            mission_profile=sx.MissionProfile(sx.MissionProfile.BALANCED),
+            federated_interval=999,
+            ltl_checker=sx.LTLConstraintChecker(penalty=-1.0),
+        )
+        # Copy weights so they start identically
+        for agent_ltl, agent_no in zip(swarm_ltl.agents, swarm_no_ltl.agents):
+            agent_ltl.model.set_weights(agent_no.model.get_weights())
+
+        # Run a single episode with the same RNG state
+        import random as _random
+        _random.seed(42)
+        np.random.seed(42)
+        r_no_ltl = swarm_no_ltl.train_episode(max_steps=20)
+
+        _random.seed(42)
+        np.random.seed(42)
+        r_ltl = swarm_ltl.train_episode(max_steps=20)
+
+        # LTL penalties make the reward lower (the penalty is <= 0)
+        assert r_ltl <= r_no_ltl + 1e-6
+
+
+# ---------------------------------------------------------------------------
+# 1b) Decision-tree showcase: export_decision_tree_rules + dt_fidelity_report
+# ---------------------------------------------------------------------------
+
+class TestExportDecisionTreeRules:
+    """Tests for export_decision_tree_rules()."""
+
+    @pytest.fixture
+    def agent_and_dt(self):
+        pytest.importorskip("sklearn")
+        agent = make_agent()
+        dt = sx.extract_decision_tree(agent, n_samples=200, max_depth=3)
+        return agent, dt
+
+    def test_returns_non_empty_string(self, agent_and_dt):
+        _, dt = agent_and_dt
+        rules = sx.export_decision_tree_rules(dt)
+        assert isinstance(rules, str)
+        assert len(rules) > 0
+
+    def test_contains_if_else(self, agent_and_dt):
+        _, dt = agent_and_dt
+        rules = sx.export_decision_tree_rules(dt)
+        assert "if " in rules
+        assert "return " in rules
+
+    def test_custom_feature_names(self, agent_and_dt):
+        _, dt = agent_and_dt
+        names = [f"feat_{i}" for i in range(11)]
+        rules = sx.export_decision_tree_rules(dt, feature_names=names)
+        # The tree may not split on every feature; check that *some* feat_ names appear
+        assert any(f"feat_{i}" in rules for i in range(11))
+
+    def test_custom_action_names(self, agent_and_dt):
+        _, dt = agent_and_dt
+        action_names = ["IDLE", "REBOOT", "REDUNDANT", "SAFE"]
+        rules = sx.export_decision_tree_rules(dt, action_names=action_names)
+        # At least one action name should appear in leaves
+        assert any(a in rules for a in action_names)
+
+    def test_coverage_annotation_present(self, agent_and_dt):
+        _, dt = agent_and_dt
+        rules = sx.export_decision_tree_rules(dt)
+        assert "coverage=" in rules
+
+    def test_raises_without_sklearn(self):
+        orig = sx._SKLEARN_AVAILABLE
+        sx._SKLEARN_AVAILABLE = False
+        try:
+            with pytest.raises(ImportError):
+                sx.export_decision_tree_rules(None)
+        finally:
+            sx._SKLEARN_AVAILABLE = orig
+
+
+class TestDtFidelityReport:
+    """Tests for dt_fidelity_report()."""
+
+    @pytest.fixture
+    def agent_and_dt(self):
+        pytest.importorskip("sklearn")
+        agent = make_agent()
+        dt = sx.extract_decision_tree(agent, n_samples=300, max_depth=4)
+        return agent, dt
+
+    def test_returns_dict_with_required_keys(self, agent_and_dt):
+        agent, dt = agent_and_dt
+        report = sx.dt_fidelity_report(agent, dt, n_eval=100)
+        for key in ("fidelity", "action_match_counts", "action_total_counts",
+                    "per_action_fidelity", "n_eval"):
+            assert key in report
+
+    def test_fidelity_in_unit_interval(self, agent_and_dt):
+        agent, dt = agent_and_dt
+        report = sx.dt_fidelity_report(agent, dt, n_eval=200)
+        assert 0.0 <= report["fidelity"] <= 1.0
+
+    def test_n_eval_matches(self, agent_and_dt):
+        agent, dt = agent_and_dt
+        report = sx.dt_fidelity_report(agent, dt, n_eval=150)
+        assert report["n_eval"] == 150
+
+    def test_action_total_counts_sum_to_n_eval(self, agent_and_dt):
+        agent, dt = agent_and_dt
+        report = sx.dt_fidelity_report(agent, dt, n_eval=100)
+        assert sum(report["action_total_counts"].values()) == 100
+
+    def test_per_action_fidelity_valid_range(self, agent_and_dt):
+        agent, dt = agent_and_dt
+        report = sx.dt_fidelity_report(agent, dt, n_eval=200)
+        for a, fid in report["per_action_fidelity"].items():
+            if fid == fid:   # skip NaN entries (action never chosen by DQN)
+                assert 0.0 <= fid <= 1.0
+
+    def test_raises_without_sklearn(self):
+        orig = sx._SKLEARN_AVAILABLE
+        sx._SKLEARN_AVAILABLE = False
+        try:
+            with pytest.raises(ImportError):
+                sx.dt_fidelity_report(None, None)
+        finally:
+            sx._SKLEARN_AVAILABLE = orig
+
+
+# ---------------------------------------------------------------------------
+# 1b) SafetyMonitor with dt_fallback
+# ---------------------------------------------------------------------------
+
+class TestSafetyMonitorDtFallback:
+    """Tests for SafetyMonitor dt_fallback parameter."""
+
+    def test_no_fallback_by_default(self):
+        m = sx.SafetyMonitor()
+        assert m.dt_fallback is None
+
+    def test_fallback_stored(self):
+        pytest.importorskip("sklearn")
+        agent = make_agent()
+        dt = sx.extract_decision_tree(agent, n_samples=100, max_depth=3)
+        m = sx.SafetyMonitor(dt_fallback=dt)
+        assert m.dt_fallback is dt
+
+    def test_hard_constraints_still_fire_with_fallback(self):
+        """Hard constraints override the DT fallback."""
+        pytest.importorskip("sklearn")
+        agent = make_agent()
+        dt = sx.extract_decision_tree(agent, n_samples=100, max_depth=3)
+        m = sx.SafetyMonitor(dt_fallback=dt)
+        # Faulted state + action=0 → must still return 3 (safe mode)
+        state = np.zeros(11, dtype=np.float32)
+        state[sx.Spacecraft.HEALTH_FLAG_IDX] = 1.0
+        assert m.veto(0, state, 4) == 3
+
+    def test_fallback_can_nudge_on_healthy_state(self):
+        """On a healthy state where DQN says 0, DT fallback may override."""
+        pytest.importorskip("sklearn")
+        # Train a trivial DT that always returns 3 (safe mode)
+        from sklearn.tree import DecisionTreeClassifier
+        dt = DecisionTreeClassifier(max_depth=1)
+        # Fit with all labels = 3
+        dummy_states = np.zeros((10, 11), dtype=np.float32)
+        dummy_labels = np.full(10, 3)
+        dt.fit(dummy_states, dummy_labels)
+
+        m = sx.SafetyMonitor(dt_fallback=dt)
+        state = np.zeros(11, dtype=np.float32)
+        # Healthy state (health_flag=0) + action=0 → DT recommends 3
+        result = m.veto(0, state, 4)
+        assert result == 3   # DT nudge applied
+
+    def test_fallback_not_applied_when_dqn_acts(self):
+        """When DQN proposes a non-zero action, DT fallback is not consulted."""
+        pytest.importorskip("sklearn")
+        from sklearn.tree import DecisionTreeClassifier
+        dt = DecisionTreeClassifier(max_depth=1)
+        dummy_states = np.zeros((10, 11), dtype=np.float32)
+        dummy_labels = np.full(10, 1)
+        dt.fit(dummy_states, dummy_labels)
+
+        m = sx.SafetyMonitor(dt_fallback=dt)
+        state = np.zeros(11, dtype=np.float32)
+        # Set power above critical threshold so hard constraint 2 doesn't fire
+        state[sx.SafetyMonitor.POWER_LEVEL_IDX] = 0.8
+        # Non-zero action (2) with healthy state → DT fallback not consulted
+        assert m.veto(2, state, 4) == 2
+
+    def test_old_api_still_works(self):
+        """SafetyMonitor() with no arguments is still valid (backward compat)."""
+        m = sx.SafetyMonitor()
+        state = np.zeros(11, dtype=np.float32)
+        state[sx.Spacecraft.HEALTH_FLAG_IDX] = 1.0
+        assert m.veto(0, state, 4) == 3
+
+    def test_package_exports_new_symbols(self):
+        """sentinel_x package re-exports all new public symbols."""
+        import sentinel_x
+        for sym in ("export_decision_tree_rules", "dt_fidelity_report"):
+            assert hasattr(sentinel_x, sym), f"Missing export: {sym}"
+
+
+# ---------------------------------------------------------------------------
+# 1c) Config: ltl section
+# ---------------------------------------------------------------------------
+
+class TestConfigLTLSection:
+    """Verify the new 'ltl' section in the default config."""
+
+    def test_ltl_section_present(self):
+        from sentinel_x.config import get_default_config
+        cfg = get_default_config()
+        assert "ltl" in cfg
+
+    def test_ltl_enabled_default_false(self):
+        from sentinel_x.config import get_default_config
+        cfg = get_default_config()
+        assert cfg["ltl"]["enabled"] is False
+
+    def test_ltl_penalty_default_negative(self):
+        from sentinel_x.config import get_default_config
+        cfg = get_default_config()
+        assert cfg["ltl"]["penalty"] < 0.0
+
+    def test_ltl_section_survives_merge(self):
+        import json
+        import tempfile
+        from sentinel_x.config import load_config
+        overrides = {"ltl": {"enabled": True}}
+        with tempfile.NamedTemporaryFile(suffix=".json", mode="w",
+                                        delete=False) as f:
+            json.dump(overrides, f)
+            fname = f.name
+        try:
+            cfg = load_config(fname)
+            assert cfg["ltl"]["enabled"] is True
+            # Default penalty untouched
+            assert cfg["ltl"]["penalty"] < 0.0
+        finally:
+            os.unlink(fname)
+
+
+# ---------------------------------------------------------------------------
+# 1c) Cookbook script: run_lunar_gateway (smoke test)
+# ---------------------------------------------------------------------------
+
+class TestRunLunarGateway:
+    """Smoke-test the Lunar Gateway cookbook script helpers."""
+
+    def test_scenario_is_power_constrained(self):
+        scenario = sx.MissionScenario.lunar_gateway()
+        assert scenario.profile == sx.MissionProfile.POWER_CONSTRAINED
+
+    def test_build_with_ltl_and_safety_monitor(self):
+        scenario = sx.MissionScenario.lunar_gateway()
+        ltl = sx.LTLConstraintChecker(penalty=-0.5)
+        swarm = sx.build_swarm_for_scenario(
+            scenario,
+            safety_monitor=sx.SafetyMonitor(),
+            ltl_checker=ltl,
+        )
+        assert swarm.ltl_checker is ltl
+        assert swarm.safety_monitor is not None
+
+    def test_train_episode_with_all_features(self):
+        scenario = sx.MissionScenario.lunar_gateway()
+        swarm = sx.build_swarm_for_scenario(
+            scenario,
+            safety_monitor=sx.SafetyMonitor(),
+            ltl_checker=sx.LTLConstraintChecker(penalty=-0.5),
+            cooperative_bonus=0.1,
+        )
+        result = swarm.train_episode(max_steps=15)
+        assert isinstance(result, float)
+        assert swarm.last_ltl_penalty <= 0.0
+        assert swarm.last_override_count >= 0
