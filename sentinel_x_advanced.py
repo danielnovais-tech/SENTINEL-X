@@ -2693,6 +2693,64 @@ class MissionScenario:
             power_drain_rate=0.11,
         )
 
+    @classmethod
+    def earth_observation_constellation(cls) -> "MissionScenario":
+        """
+        Medium-Earth orbit Earth-observation constellation with task allocation.
+
+        Key characteristics:
+        - Six spacecraft in a Walker-Delta constellation for broad area
+          coverage of high-priority targets.
+        - Moderate radiation environment (2 000–20 000 km altitude, outer
+          Van Allen belt fringe).
+        - Ground contacts every ~90 min; imaging tasks are auctioned to the
+          spacecraft with the best view angle and highest health score.
+        - High cooperative-reward incentive: multi-spacecraft stereo imaging
+          yields bonus science value.
+        - Designed for use with :class:`~sentinel_x.coordination.TaskAllocator`
+          and :class:`~sentinel_x.coordination.SwarmReconfigurationManager`.
+        """
+        return cls(
+            name="Earth Observation Constellation (MEO)",
+            profile=MissionProfile.MAXIMIZE_DATA_RETURN,
+            num_spacecraft=6,
+            comm_delay_steps=0,           # near-real-time ground relay
+            link_dropout_prob=0.10,       # occasional cloud/atmospheric dropout
+            thermal_drift_std=0.18,       # less extreme than LEO cycling
+            thermal_spike_prob=0.010,
+            flip_rate_per_bit=8e-5,       # moderate inner-belt fringe
+            sensor_stuck_prob=0.012,
+            power_drain_rate=0.10,        # good solar conditions at MEO
+        )
+
+    @classmethod
+    def deep_space_telescope_array(cls) -> "MissionScenario":
+        """
+        Sparse-aperture space telescope array at the Sun-Earth L2 point.
+
+        Key characteristics:
+        - Four spacecraft flying in precise diamond formation (50 m baseline)
+          to synthesise a large virtual aperture.
+        - Formation coherence is mission-critical; a
+          :class:`~sentinel_x.formation.FormationController` should be used
+          with ``formation_type="diamond"``.
+        - Extremely low radiation at L2 compared to cislunar space.
+        - Power-critical: solar panels sized for L2 distance (~1 AU).
+        - Communication via Deep Space Network; round-trip delay ~3 s.
+        """
+        return cls(
+            name="Deep Space Telescope Array (L2)",
+            profile=MissionProfile.POWER_CONSTRAINED,
+            num_spacecraft=4,
+            comm_delay_steps=0,           # L2 DSN delay negligible in sim
+            link_dropout_prob=0.03,       # very stable link from L2
+            thermal_drift_std=0.08,       # thermally stable environment
+            thermal_spike_prob=0.003,
+            flip_rate_per_bit=2e-5,       # low radiation at L2
+            sensor_stuck_prob=0.005,
+            power_drain_rate=0.08,        # similar solar flux to LEO
+        )
+
     def summary(self) -> str:
         """Return a formatted one-page summary of the scenario parameters."""
         lines = [

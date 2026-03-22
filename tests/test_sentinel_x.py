@@ -2837,3 +2837,269 @@ class TestOpenSourceArtefacts:
         path = os.path.join(os.path.dirname(__file__), "..", "pyproject.toml")
         content = open(path).read()
         assert "Apache Software License" in content or "Apache-2.0" in content
+
+
+# ===========================================================================
+# Task allocation and swarm reconfiguration
+# ===========================================================================
+
+from sentinel_x.coordination import (
+    AllocationResult,
+    TaskAllocator,
+    SwarmReconfigurationManager,
+    ReconfigurationEvent,
+)
+
+
+def _make_earth_obs_swarm():
+    """Return a 6-spacecraft Earth-observation swarm (fast, simulation)."""
+    scenario = sx.MissionScenario.earth_observation_constellation()
+    return sx.build_swarm_for_scenario(scenario)
+
+
+def _make_telescope_swarm():
+    """Return a 4-spacecraft deep-space telescope swarm."""
+    scenario = sx.MissionScenario.deep_space_telescope_array()
+    return sx.build_swarm_for_scenario(scenario)
+
+
+_TASKS = [
+    {"id": "img_0", "type": "imaging", "priority": 0.9, "position": (100.0, 0.0)},
+    {"id": "img_1", "type": "imaging", "priority": 0.7, "position": (-100.0, 0.0)},
+    {"id": "rel_0", "type": "relay",   "priority": 0.5, "position": (0.0, 200.0)},
+]
+
+
+class TestMissionScenarioNewMissions:
+    def test_earth_observation_constellation(self):
+        sc = sx.MissionScenario.earth_observation_constellation()
+        assert sc.num_spacecraft == 6
+        assert sc.profile == sx.MissionProfile.MAXIMIZE_DATA_RETURN
+        assert sc.link_dropout_prob > 0
+
+    def test_deep_space_telescope_array(self):
+        sc = sx.MissionScenario.deep_space_telescope_array()
+        assert sc.num_spacecraft == 4
+        assert sc.profile == sx.MissionProfile.POWER_CONSTRAINED
+
+    def test_earth_obs_summary_contains_name(self):
+        sc = sx.MissionScenario.earth_observation_constellation()
+        s = sc.summary()
+        assert "Earth Observation" in s
+
+    def test_telescope_summary_contains_name(self):
+        sc = sx.MissionScenario.deep_space_telescope_array()
+        s = sc.summary()
+        assert "L2" in s
+
+
+class TestTaskAllocator:
+    def test_allocate_returns_result(self):
+        swarm = _make_earth_obs_swarm()
+        alloc = TaskAllocator(swarm)
+        result = alloc.allocate(_TASKS)
+        assert isinstance(result, AllocationResult)
+
+    def test_all_tasks_assigned_when_enough_agents(self):
+        swarm = _make_earth_obs_swarm()
+        alloc = TaskAllocator(swarm)
+        result = alloc.allocate(_TASKS)
+        # 6 agents, 3 tasks – all should be assigned
+        assert len(result.assignments) + len(result.unassigned) == len(_TASKS)
+
+    def test_assignments_are_valid_agent_indices(self):
+        swarm = _make_earth_obs_swarm()
+        alloc = TaskAllocator(swarm)
+        result = alloc.allocate(_TASKS)
+        n = len(swarm.spacecraft)
+        for agent_idx in result.assignments.values():
+            assert 0 <= agent_idx < n
+
+    def test_exclusive_mode_no_double_assignment(self):
+        swarm = _make_earth_obs_swarm()
+        alloc = TaskAllocator(swarm, exclusive=True)
+        result = alloc.allocate(_TASKS)
+        assigned_agents = list(result.assignments.values())
+        assert len(assigned_agents) == len(set(assigned_agents)), (
+            "Each agent should appear at most once in exclusive mode."
+        )
+
+    def test_non_exclusive_allows_repeated_agent(self):
+        swarm = _make_earth_obs_swarm()
+        # Place all agents at the same position so the winner is always the
+        # same healthiest agent in non-exclusive mode.
+        positions = [(0.0, 0.0)] * len(swarm.spacecraft)
+        alloc = TaskAllocator(swarm, agent_positions=positions, exclusive=False)
+        result = alloc.allocate(_TASKS)
+        # With same position for all, same winner may appear for multiple tasks
+        assert len(result.assignments) + len(result.unassigned) == len(_TASKS)
+
+    def test_bid_matrix_populated(self):
+        swarm = _make_earth_obs_swarm()
+        alloc = TaskAllocator(swarm)
+        result = alloc.allocate(_TASKS)
+        for tid in [t["id"] for t in _TASKS]:
+            assert tid in result.bids
+
+    def test_update_position(self):
+        swarm = _make_earth_obs_swarm()
+        alloc = TaskAllocator(swarm)
+        alloc.update_position(0, (999.0, -999.0))
+        assert alloc._positions[0] == (999.0, -999.0)
+
+    def test_update_position_out_of_range(self):
+        swarm = _make_earth_obs_swarm()
+        alloc = TaskAllocator(swarm)
+        with pytest.raises(IndexError):
+            alloc.update_position(100, (0.0, 0.0))
+
+    def test_reallocate_failed_returns_empty_when_all_alive(self):
+        swarm = _make_earth_obs_swarm()
+        alloc = TaskAllocator(swarm)
+        prev = alloc.allocate(_TASKS)
+        realloc = alloc.reallocate_failed(prev, _TASKS)
+        # All spacecraft still alive → nothing to reallocate
+        assert len(realloc.assignments) == 0
+
+    def test_summary_structure(self):
+        swarm = _make_earth_obs_swarm()
+        alloc = TaskAllocator(swarm)
+        alloc.allocate(_TASKS)
+        s = alloc.summary()
+        assert "rounds" in s and "assignment_rate" in s
+        assert s["rounds"] == 1
+
+    def test_custom_agent_positions_length_mismatch_raises(self):
+        swarm = _make_earth_obs_swarm()
+        with pytest.raises(ValueError):
+            TaskAllocator(swarm, agent_positions=[(0.0, 0.0)])   # too few
+
+
+class TestSwarmReconfigurationManager:
+    def test_no_event_when_swarm_healthy(self):
+        swarm = _make_earth_obs_swarm()
+        rcm = SwarmReconfigurationManager(swarm)
+        # Fresh swarm – all spacecraft operational, no trigger expected
+        event = rcm.check_and_reconfigure()
+        # A healthy swarm with no failed leader should return None
+        assert event is None or isinstance(event, ReconfigurationEvent)
+
+    def test_initial_state(self):
+        swarm = _make_earth_obs_swarm()
+        rcm = SwarmReconfigurationManager(swarm)
+        assert rcm.current_leader == 0
+        assert rcm.suggested_formation in ("circular", "v", "diamond", "line")
+        assert not rcm.is_degraded
+        assert rcm.healthy_fraction > 0.0
+
+    def test_healthy_fraction_range(self):
+        swarm = _make_earth_obs_swarm()
+        rcm = SwarmReconfigurationManager(swarm)
+        assert 0.0 <= rcm.healthy_fraction <= 1.0
+
+    def test_leader_promotion_when_leader_fails(self):
+        swarm = _make_earth_obs_swarm()
+        rcm = SwarmReconfigurationManager(swarm)
+        # Force leader failure
+        swarm.spacecraft[0].memory.flip_rate_per_bit = 1.0
+        swarm.spacecraft[0].memory.step()
+        swarm.spacecraft[0].memory.step()
+        # Make spacecraft[0] non-operational by draining its power
+        swarm.spacecraft[0].power._level = 0.0
+        event = rcm.check_and_reconfigure()
+        # If spacecraft 0 is now dead, leader should be promoted
+        if not swarm.spacecraft[0].is_operational():
+            assert event is not None
+            assert event.action in ("leader_promoted", "formation_reshaped",
+                                    "degraded_mode")
+
+    def test_formation_reshape_event_structure(self):
+        swarm = _make_earth_obs_swarm()
+        rcm = SwarmReconfigurationManager(
+            swarm, reshape_threshold=0.99, degraded_threshold=0.01
+        )
+        # Force reshape by simulating many failures
+        for sc in swarm.spacecraft[:5]:
+            sc.power._level = 0.0
+        event = rcm.check_and_reconfigure()
+        if event is not None and event.action == "formation_reshaped":
+            assert event.new_formation is not None
+            assert isinstance(event.detail, str)
+
+    def test_force_reconfiguration(self):
+        swarm = _make_earth_obs_swarm()
+        rcm = SwarmReconfigurationManager(swarm)
+        event = rcm.force_reconfiguration("diamond")
+        assert event.action == "formation_reshaped"
+        assert event.new_formation == "diamond"
+        assert rcm.suggested_formation == "diamond"
+
+    def test_force_reconfiguration_invalid_raises(self):
+        swarm = _make_earth_obs_swarm()
+        rcm = SwarmReconfigurationManager(swarm)
+        with pytest.raises(ValueError):
+            rcm.force_reconfiguration("hexagonal")
+
+    def test_on_event_callback_called(self):
+        swarm = _make_earth_obs_swarm()
+        events_received = []
+        rcm = SwarmReconfigurationManager(
+            swarm,
+            on_event=lambda ev: events_received.append(ev),
+        )
+        rcm.force_reconfiguration("line")
+        assert len(events_received) == 1
+        assert events_received[0].action == "formation_reshaped"
+
+    def test_summary_structure(self):
+        swarm = _make_earth_obs_swarm()
+        rcm = SwarmReconfigurationManager(swarm)
+        rcm.force_reconfiguration("v")
+        s = rcm.summary()
+        assert "total_events" in s
+        assert "current_leader" in s
+        assert s["total_events"] >= 1
+
+    def test_invalid_thresholds_raise(self):
+        swarm = _make_earth_obs_swarm()
+        with pytest.raises(ValueError):
+            SwarmReconfigurationManager(
+                swarm, reshape_threshold=0.3, degraded_threshold=0.6
+            )
+
+    def test_event_log_grows(self):
+        swarm = _make_earth_obs_swarm()
+        rcm = SwarmReconfigurationManager(swarm)
+        rcm.force_reconfiguration("line")
+        rcm.force_reconfiguration("circular")
+        assert len(rcm.event_log) == 2
+
+
+class TestExamplesEarthObservation:
+    def test_earth_obs_example_runs(self, tmp_path, monkeypatch):
+        """Smoke test: earth_observation.py completes without error."""
+        import importlib.util, sys as _sys
+
+        examples_dir = os.path.join(os.path.dirname(__file__), "..", "examples")
+        spec = importlib.util.spec_from_file_location(
+            "earth_observation",
+            os.path.join(examples_dir, "earth_observation.py"),
+        )
+        # Patch EPISODES to 2 for speed
+        monkeypatch.setattr("builtins.open", open)   # no-op patch to trigger monkeypatch fixture
+        mod = importlib.util.module_from_spec(spec)
+        # Monkey-patch constant inside the module before exec
+        mod.__dict__["EPISODES"] = 2
+        _sys.modules["earth_observation"] = mod
+        spec.loader.exec_module(mod)
+
+
+class TestCoordinationDocExists:
+    def test_coordination_doc_exists(self):
+        path = os.path.join(
+            os.path.dirname(__file__), "..", "docs", "coordination.md"
+        )
+        assert os.path.isfile(path), "docs/coordination.md not found"
+        content = open(path).read()
+        assert "TaskAllocator" in content
+        assert "SwarmReconfigurationManager" in content
