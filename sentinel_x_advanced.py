@@ -452,7 +452,8 @@ class DQNAgent:
     def _build_model(self, lr):
         model = models.Sequential(
             [
-                layers.Dense(64, activation="relu", input_shape=(self.state_dim,)),
+                layers.Input(shape=(self.state_dim,)),
+                layers.Dense(64, activation="relu"),
                 layers.Dense(64, activation="relu"),
                 layers.Dense(self.action_dim, activation="linear"),
             ]
