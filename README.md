@@ -46,6 +46,30 @@ pip install -r requirements.txt
 
 ---
 
+## Quick Demo (< 1 minute)
+
+Train a Lunar Gateway swarm, verify the policy, and export a deployment-ready
+int8 TFLite model — all in under a minute on CPU:
+
+```bash
+python examples/lunar_gateway.py
+```
+
+For a full, configurable pipeline (train → evaluate → export → verify →
+certify → surrogate) driven by a YAML config file:
+
+```bash
+# Save a config template, edit it, then run
+python run_experiment.py --save-config my_config.yaml
+python run_experiment.py --config my_config.yaml --scenario lunar_gateway --episodes 50
+```
+
+See [docs/ltl_constraints.md](docs/ltl_constraints.md) and
+[docs/decision_tree_certification.md](docs/decision_tree_certification.md)
+for deeper explanations of the key algorithms.
+
+---
+
 ## Usage
 
 ### Basic Q-learning simulation
@@ -671,17 +695,38 @@ SENTINEL-X/
 │   ├── __init__.py             # re-exports full public API
 │   └── config.py               # YAML/JSON configuration loader
 ├── scripts/
-│   └── replay_tflite.py        # embedded deployment / latency benchmark
+│   ├── replay_tflite.py        # embedded deployment / latency benchmark
+│   └── run_lunar_gateway.py    # full Lunar Gateway experiment cookbook
+├── examples/
+│   └── lunar_gateway.py        # < 1-minute quickstart demo
+├── docs/
+│   ├── ltl_constraints.md      # How LTL Constraints Work
+│   └── decision_tree_certification.md  # DT certification explainer
 ├── tests/
 │   └── test_sentinel_x.py      # 196 pytest tests
 ├── sentinel_x_advanced.py      # canonical implementation
 ├── sentinel_x_config.yaml      # default configuration template
+├── run_experiment.py           # config-driven experiment runner
 ├── pyproject.toml              # PEP 517 packaging metadata
 ├── requirements.txt
 └── .github/
     └── workflows/
         └── ci.yml              # GitHub Actions CI pipeline
 ```
+
+---
+
+## Documentation
+
+Additional technical documentation lives in the `docs/` folder:
+
+* [**docs/ltl_constraints.md**](docs/ltl_constraints.md) — How LTL
+  constraint-checking works, built-in predicates, how to add custom
+  constraints, and how it complements the `SafetyMonitor`.
+
+* [**docs/decision_tree_certification.md**](docs/decision_tree_certification.md) —
+  Extracting, evaluating, and exporting the decision-tree surrogate policy for
+  formal verification and embedded fallback deployment.
 
 ---
 

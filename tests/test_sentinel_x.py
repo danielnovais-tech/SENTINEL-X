@@ -1691,3 +1691,175 @@ class TestRunLunarGateway:
         assert isinstance(result, float)
         assert swarm.last_ltl_penalty <= 0.0
         assert swarm.last_override_count >= 0
+
+
+# ===========================================================================
+# run_experiment.py tests
+# ===========================================================================
+
+class TestRunExperiment:
+    """Smoke tests for the config-driven run_experiment.py runner."""
+
+    def _import_runner(self):
+        """Import run_experiment.py (lives in repo root)."""
+        import importlib.util
+        import os
+        spec = importlib.util.spec_from_file_location(
+            "run_experiment",
+            os.path.join(os.path.dirname(__file__), "..", "run_experiment.py"),
+        )
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        return mod
+
+    def test_step_train_returns_list(self):
+        runner = self._import_runner()
+        swarm = sx.FederatedSwarm(
+            num_spacecraft=2, action_dim=4,
+            mission_profile=sx.MissionProfile(sx.MissionProfile.BALANCED),
+            federated_interval=999,
+        )
+        cfg = {"training": {"episodes": 3, "max_steps": 10}}
+        rewards = runner.step_train(swarm, cfg)
+        assert isinstance(rewards, list)
+        assert len(rewards) == 3
+
+    def test_step_evaluate_returns_float(self):
+        runner = self._import_runner()
+        swarm = sx.FederatedSwarm(
+            num_spacecraft=2, action_dim=4,
+            mission_profile=sx.MissionProfile(sx.MissionProfile.BALANCED),
+        )
+        cfg = {"training": {"max_steps": 20}}
+        ops = runner.step_evaluate(swarm, cfg)
+        assert isinstance(ops, float)
+        assert 0.0 <= ops <= 20.0
+
+    def test_step_export_writes_files(self):
+        import tempfile
+        runner = self._import_runner()
+        swarm = sx.FederatedSwarm(
+            num_spacecraft=2, action_dim=4,
+            mission_profile=sx.MissionProfile(sx.MissionProfile.BALANCED),
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "model_int8.tflite")
+            cfg = {"deployment": {"tflite_int8_path": path}}
+            result = runner.step_export(swarm, cfg)
+        assert "dynamic" in result
+        assert "int8" in result
+
+    def test_step_verify_returns_dict(self):
+        runner = self._import_runner()
+        swarm = sx.FederatedSwarm(
+            num_spacecraft=2, action_dim=4,
+            mission_profile=sx.MissionProfile(sx.MissionProfile.BALANCED),
+        )
+        report = runner.step_verify(swarm)
+        assert "overall_passed" in report
+        assert "safety_constraint" in report
+
+    def test_step_certify_returns_dict(self):
+        runner = self._import_runner()
+        swarm = sx.FederatedSwarm(
+            num_spacecraft=2, action_dim=4,
+            mission_profile=sx.MissionProfile(sx.MissionProfile.BALANCED),
+        )
+        cert = runner.step_certify(swarm, n_adv=20)
+        assert "mean_radius" in cert
+        assert "robust_frac" in cert
+
+    def test_step_surrogate_returns_dict_or_empty(self):
+        runner = self._import_runner()
+        swarm = sx.FederatedSwarm(
+            num_spacecraft=2, action_dim=4,
+            mission_profile=sx.MissionProfile(sx.MissionProfile.BALANCED),
+        )
+        result = runner.step_surrogate(swarm, rules_path="/tmp/_sx_test_rules.txt")
+        assert isinstance(result, dict)
+
+    def test_save_config_writes_yaml(self):
+        import tempfile
+        runner = self._import_runner()
+
+        class _Args:
+            save_config = None
+            config = None
+            scenario = None
+            episodes = None
+            max_steps = None
+            no_export = True
+            no_verify = True
+            no_certify = True
+            no_surrogate = True
+
+        with tempfile.NamedTemporaryFile(suffix=".yaml", delete=False) as f:
+            fname = f.name
+        try:
+            args = _Args()
+            args.save_config = fname
+            runner.run(args)
+            assert os.path.getsize(fname) > 0
+        finally:
+            os.unlink(fname)
+
+    def test_build_swarm_from_config_no_ltl(self):
+        runner = self._import_runner()
+        from sentinel_x.config import get_default_config
+        cfg = get_default_config()
+        cfg["ltl"]["enabled"] = False
+        swarm = runner._build_swarm_from_config(cfg, None)
+        assert swarm.ltl_checker is None
+
+    def test_build_swarm_from_config_with_ltl(self):
+        runner = self._import_runner()
+        from sentinel_x.config import get_default_config
+        cfg = get_default_config()
+        cfg["ltl"]["enabled"] = True
+        cfg["ltl"]["penalty"] = -1.0
+        swarm = runner._build_swarm_from_config(cfg, None)
+        assert swarm.ltl_checker is not None
+
+    def test_build_swarm_with_scenario(self):
+        runner = self._import_runner()
+        from sentinel_x.config import get_default_config
+        cfg = get_default_config()
+        scenario = sx.MissionScenario.lunar_gateway()
+        swarm = runner._build_swarm_from_config(cfg, scenario)
+        assert len(swarm.spacecraft) == scenario.num_spacecraft
+
+    def test_run_minimal_no_verify_no_certify(self):
+        """Full run with all optional steps disabled (fast smoke test)."""
+        runner = self._import_runner()
+
+        class _Args:
+            save_config = None
+            config = None
+            scenario = None
+            episodes = 2
+            max_steps = 10
+            no_export = True
+            no_verify = True
+            no_certify = True
+            no_surrogate = True
+
+        runner.run(_Args())  # must not raise
+
+
+# ===========================================================================
+# examples/lunar_gateway.py smoke test
+# ===========================================================================
+
+class TestExamplesLunarGateway:
+    """Verify examples/lunar_gateway.py imports and scenario is correct."""
+
+    def test_scenario_type(self):
+        scenario = sx.MissionScenario.lunar_gateway()
+        assert scenario.profile == sx.MissionProfile.POWER_CONSTRAINED
+
+    def test_example_file_exists(self):
+        import os
+        path = os.path.join(
+            os.path.dirname(__file__), "..", "examples", "lunar_gateway.py"
+        )
+        assert os.path.isfile(path), "examples/lunar_gateway.py is missing"
