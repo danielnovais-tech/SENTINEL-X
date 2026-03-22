@@ -2318,3 +2318,403 @@ class TestFormalVerification:
             "formal_verification_external.md"
         )
         assert os.path.isfile(path)
+
+
+# ===========================================================================
+# sentinel_x/formation.py tests
+# ===========================================================================
+
+class TestConsensusProtocol:
+    """Tests for the distributed consensus protocol."""
+
+    def test_convergence_ring(self):
+        from sentinel_x.formation import ConsensusProtocol
+        cp = ConsensusProtocol(n_agents=4, mixing_weight=0.5, topology="ring")
+        cp.set_values([1.0, 0.0, 1.0, 0.0])
+        cp.run(n_steps=30)
+        mean = float(np.mean(cp.values))
+        assert abs(mean - 0.5) < 1e-6
+        assert cp.converged
+
+    def test_convergence_complete(self):
+        from sentinel_x.formation import ConsensusProtocol
+        cp = ConsensusProtocol(n_agents=5, mixing_weight=0.8, topology="complete")
+        cp.set_values([0.0, 0.2, 0.4, 0.6, 0.8])
+        cp.run(n_steps=10)
+        assert cp.converged
+        assert abs(float(np.mean(cp.values)) - 0.4) < 1e-4
+
+    def test_convergence_star(self):
+        from sentinel_x.formation import ConsensusProtocol
+        cp = ConsensusProtocol(n_agents=4, mixing_weight=0.6, topology="star")
+        cp.set_values([1.0, 0.0, 0.5, 0.25])
+        cp.run(n_steps=40)
+        assert cp.converged
+
+    def test_history_length(self):
+        from sentinel_x.formation import ConsensusProtocol
+        cp = ConsensusProtocol(n_agents=3, mixing_weight=0.5, topology="ring")
+        cp.set_values([0.1, 0.5, 0.9])
+        cp.run(n_steps=5)
+        # history starts with initial + 5 steps = 6 entries
+        assert len(cp.history) == 6
+
+    def test_convergence_step_reported(self):
+        from sentinel_x.formation import ConsensusProtocol
+        cp = ConsensusProtocol(n_agents=3, mixing_weight=0.9, topology="complete")
+        cp.set_values([1.0, 0.0, 0.0])
+        cp.run(n_steps=20)
+        step = cp.convergence_step
+        assert step is not None
+        assert step >= 0
+
+    def test_invalid_topology(self):
+        from sentinel_x.formation import ConsensusProtocol
+        import pytest
+        with pytest.raises(ValueError, match="topology"):
+            ConsensusProtocol(n_agents=3, topology="mesh")
+
+    def test_invalid_n_agents(self):
+        from sentinel_x.formation import ConsensusProtocol
+        import pytest
+        with pytest.raises(ValueError, match="at least 2"):
+            ConsensusProtocol(n_agents=1)
+
+    def test_wrong_values_length(self):
+        from sentinel_x.formation import ConsensusProtocol
+        import pytest
+        cp = ConsensusProtocol(n_agents=3)
+        with pytest.raises(ValueError, match="Expected 3"):
+            cp.set_values([0.1, 0.2])
+
+
+class TestFormationGeometry:
+    """Tests for formation geometry builders."""
+
+    def test_line_formation(self):
+        from sentinel_x.formation import FormationGeometry
+        g = FormationGeometry.build(n_followers=3, formation_type="line", separation_m=100.0)
+        assert len(g.offsets) == 3
+        for i, (dx, dy) in enumerate(g.offsets, start=1):
+            assert dx == -i * 100.0
+            assert dy == 0.0
+
+    def test_v_formation(self):
+        from sentinel_x.formation import FormationGeometry
+        g = FormationGeometry.build(n_followers=4, formation_type="v", separation_m=100.0)
+        assert len(g.offsets) == 4
+
+    def test_diamond_formation(self):
+        from sentinel_x.formation import FormationGeometry
+        g = FormationGeometry.build(n_followers=4, formation_type="diamond", separation_m=100.0)
+        assert len(g.offsets) == 4
+
+    def test_circular_formation_angles(self):
+        from sentinel_x.formation import FormationGeometry
+        import math
+        g = FormationGeometry.build(n_followers=4, formation_type="circular", separation_m=100.0)
+        assert len(g.offsets) == 4
+        # All followers at distance 100 from origin
+        for dx, dy in g.offsets:
+            dist = math.sqrt(dx ** 2 + dy ** 2)
+            assert abs(dist - 100.0) < 1e-6
+
+    def test_invalid_formation_type(self):
+        from sentinel_x.formation import FormationGeometry
+        import pytest
+        with pytest.raises(ValueError, match="formation_type"):
+            FormationGeometry.build(n_followers=2, formation_type="hexagon")
+
+
+class TestFormationController:
+    """Tests for the leader-follower formation controller."""
+
+    def _make_swarm(self):
+        swarm = sx.FederatedSwarm(
+            num_spacecraft=3, action_dim=4,
+            mission_profile=sx.MissionProfile(sx.MissionProfile.BALANCED),
+        )
+        return swarm
+
+    def test_init_line_formation(self):
+        from sentinel_x.formation import FormationController
+        swarm = self._make_swarm()
+        fc = FormationController(swarm, formation_type="line", separation_m=100.0)
+        assert fc.metrics is not None
+        errors = fc.formation_errors()
+        assert len(errors) == 2    # 3 SC - 1 leader = 2 followers
+
+    def test_formation_coherence_initial(self):
+        from sentinel_x.formation import FormationController
+        swarm = self._make_swarm()
+        fc = FormationController(swarm, formation_type="line", separation_m=100.0)
+        coherence = fc.formation_coherence()
+        assert 0.0 <= coherence <= 1.0
+
+    def test_train_episode_with_formation(self):
+        from sentinel_x.formation import FormationController
+        swarm = self._make_swarm()
+        fc = FormationController(swarm, formation_type="line", separation_m=50.0)
+        reward = fc.train_episode_with_formation(max_steps=50)
+        assert isinstance(reward, float)
+
+    def test_metrics_after_training(self):
+        from sentinel_x.formation import FormationController
+        swarm = self._make_swarm()
+        fc = FormationController(swarm, formation_type="v", separation_m=100.0)
+        for _ in range(3):
+            fc.train_episode_with_formation(max_steps=20)
+        summary = fc.metrics.summary()
+        assert summary["n_steps"] == 3
+        assert 0.0 <= summary["mean_coherence"] <= 1.0
+
+    def test_consensus_estimate(self):
+        from sentinel_x.formation import FormationController
+        swarm = self._make_swarm()
+        fc = FormationController(swarm, formation_type="line", separation_m=100.0)
+        est = fc.get_consensus_estimate()
+        assert "agents" in est
+        assert "mean" in est
+        assert "std" in est
+        assert len(est["agents"]) == 3
+
+
+class TestFormationMetrics:
+    def test_empty_summary(self):
+        from sentinel_x.formation import FormationMetrics
+        m = FormationMetrics(n_spacecraft=3)
+        s = m.summary()
+        assert s["n_steps"] == 0
+
+    def test_record_and_summary(self):
+        from sentinel_x.formation import FormationMetrics
+        m = FormationMetrics(n_spacecraft=3)
+        m.record(step=0, coherence=0.9, errors=np.array([10.0, 20.0]))
+        m.record(step=1, coherence=0.8, errors=np.array([15.0, 25.0]))
+        s = m.summary()
+        assert s["n_steps"] == 2
+        assert abs(s["mean_coherence"] - 0.85) < 1e-6
+        assert s["max_error_m"] == 25.0
+
+    def test_ring_buffer_capacity(self):
+        from sentinel_x.formation import FormationMetrics
+        m = FormationMetrics(n_spacecraft=2, capacity=5)
+        for i in range(10):
+            m.record(step=i, coherence=0.5, errors=np.array([1.0]))
+        assert m.summary()["n_steps"] == 5
+
+
+# ===========================================================================
+# sentinel_x/mission_control.py tests
+# ===========================================================================
+
+class TestMissionControlBridge:
+    """Tests for the mission control integration module."""
+
+    def _import_mc(self):
+        from sentinel_x import mission_control as mc
+        return mc
+
+    def test_module_imports(self):
+        mc = self._import_mc()
+        assert hasattr(mc, "MissionControlBridge")
+        assert hasattr(mc, "FPrimeAdapter")
+        assert hasattr(mc, "TASTEAdapter")
+        assert hasattr(mc, "available_adapters")
+
+    def test_sentinel_x_package_exports_mc(self):
+        import sentinel_x as sx
+        assert hasattr(sx, "MissionControlBridge")
+        assert hasattr(sx, "FPrimeAdapter")
+        assert hasattr(sx, "TASTEAdapter")
+        assert hasattr(sx, "available_adapters")
+
+    def test_available_adapters_returns_dict(self):
+        mc    = self._import_mc()
+        avail = mc.available_adapters()
+        assert isinstance(avail, dict)
+        assert "fprime" in avail and "taste" in avail
+        for v in avail.values():
+            assert isinstance(v, bool)
+
+    def test_base_bridge_publish_log(self, tmp_path):
+        mc = self._import_mc()
+
+        class SimpleBridge(mc.MissionControlBridge):
+            pass
+
+        log = str(tmp_path / "telem.jsonl")
+        bridge = SimpleBridge(log_path=log)
+        bridge.connect()
+        bridge.publish_telemetry({"spacecraft_id": 0, "step": 1, "action": 2})
+        bridge.publish_episode_summary(episode=1, reward=3.5, overrides=0)
+        bridge.send_command("RESET", {})
+        bridge.disconnect()
+
+        assert os.path.isfile(log)
+        import json
+        lines = open(log).readlines()
+        assert len(lines) == 3    # publish + summary + command
+        assert json.loads(lines[0])["spacecraft_id"] == 0
+
+    def test_base_bridge_tx_count(self, tmp_path):
+        mc = self._import_mc()
+
+        class SimpleBridge(mc.MissionControlBridge):
+            pass
+
+        bridge = SimpleBridge(log_path=None)
+        bridge.connect()
+        assert bridge.tx_count == 0
+        bridge.publish_telemetry({"x": 1})
+        bridge.publish_telemetry({"x": 2})
+        assert bridge.tx_count == 2
+        bridge.send_command("CMD", {})
+        assert bridge.rx_count == 1
+
+    def test_base_bridge_context_manager(self, tmp_path):
+        mc = self._import_mc()
+
+        class SimpleBridge(mc.MissionControlBridge):
+            pass
+
+        log = str(tmp_path / "telem2.jsonl")
+        with SimpleBridge(log_path=log) as bridge:
+            assert bridge.is_connected
+            bridge.publish_telemetry({"ok": True})
+        assert not bridge.is_connected
+
+    def test_fprime_adapter_raises_import_error(self):
+        mc = self._import_mc()
+        if mc._HAS_FPRIME:
+            import pytest
+            pytest.skip("fprime-gds is installed")
+        import pytest
+        with pytest.raises(ImportError, match="fprime"):
+            mc.FPrimeAdapter()
+
+    def test_taste_adapter_raises_import_error(self):
+        mc = self._import_mc()
+        if mc._HAS_ASN1:
+            import pytest
+            pytest.skip("asn1tools is installed")
+        import pytest
+        with pytest.raises(ImportError, match="asn1"):
+            mc.TASTEAdapter()
+
+    def test_mission_control_docs_exist(self):
+        path = os.path.join(
+            os.path.dirname(__file__), "..", "docs",
+            "mission_control_integration.md"
+        )
+        assert os.path.isfile(path)
+
+
+# ===========================================================================
+# scripts/hardware_timing_validator.py tests
+# ===========================================================================
+
+class TestHardwareTimingValidator:
+    """Tests for the hardware timing validation script."""
+
+    def _import_validator(self):
+        import importlib.util, sys
+        path = os.path.join(os.path.dirname(__file__), "..",
+                            "scripts", "hardware_timing_validator.py")
+        spec = importlib.util.spec_from_file_location("hardware_timing_validator", path)
+        mod  = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        return mod
+
+    def test_script_exists(self):
+        path = os.path.join(
+            os.path.dirname(__file__), "..", "scripts",
+            "hardware_timing_validator.py"
+        )
+        assert os.path.isfile(path)
+
+    def test_state_normalisation_timing(self):
+        mod = self._import_validator()
+        stats, ok = mod._test_state_normalisation(runs=50, quiet=True)
+        assert ok
+        assert "p99_ms" in stats
+        assert stats["p99_ms"] < 10.0   # must be well under budget on any machine
+
+    def test_safety_monitor_timing(self):
+        mod = self._import_validator()
+        stats, ok = mod._test_safety_monitor(runs=50, quiet=True)
+        assert ok
+        assert stats["p99_ms"] < 10.0
+
+    def test_main_simulation_mode(self, tmp_path):
+        mod = self._import_validator()
+        report_path = str(tmp_path / "timing_report.json")
+        ret = mod.main([
+            "--runs",   "30",
+            "--output", report_path,
+            "--quiet",
+        ])
+        assert ret == 0
+        import json
+        report = json.loads(open(report_path).read())
+        assert "inference"      in report
+        assert "normalisation"  in report
+        assert "safety_monitor" in report
+        assert report["summary"]["all_passed"] is True
+
+    def test_deployment_validation_docs_exist(self):
+        path = os.path.join(
+            os.path.dirname(__file__), "..", "docs",
+            "hardware_deployment_validation.md"
+        )
+        assert os.path.isfile(path)
+
+
+# ===========================================================================
+# scripts/dashboard.py tests
+# ===========================================================================
+
+class TestDashboard:
+    """Tests for the operator dashboard module."""
+
+    def _import_dashboard(self):
+        import importlib.util
+        path = os.path.join(os.path.dirname(__file__), "..",
+                            "scripts", "dashboard.py")
+        spec = importlib.util.spec_from_file_location("dashboard", path)
+        mod  = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        return mod
+
+    def test_script_exists(self):
+        path = os.path.join(os.path.dirname(__file__), "..",
+                            "scripts", "dashboard.py")
+        assert os.path.isfile(path)
+
+    def test_dashboard_state_init(self):
+        mod = self._import_dashboard()
+        state = mod.DashboardState(n_spacecraft=4)
+        assert state.n_spacecraft == 4
+        assert len(state.health) == 4
+        assert state.episode == 0
+
+    def test_dashboard_state_update_and_snapshot(self):
+        mod = self._import_dashboard()
+        state = mod.DashboardState(n_spacecraft=3)
+        state.update(episode=5, overrides=2)
+        snap = state.snapshot()
+        assert snap["episode"] == 5
+        assert snap["overrides"] == 2
+
+    def test_action_labels(self):
+        mod = self._import_dashboard()
+        assert len(mod.ACTION_LABELS) == 4
+        assert mod.ACTION_LABELS[0] == "DO_NOTHING"
+        assert mod.ACTION_LABELS[3] == "SAFE_MODE"
+
+    def test_formation_coordination_docs_exist(self):
+        path = os.path.join(
+            os.path.dirname(__file__), "..", "docs",
+            "formation_coordination.md"
+        )
+        assert os.path.isfile(path)

@@ -35,9 +35,13 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-yaml = ["pyyaml>=6.0"]
-shap = ["shap>=0.43"]
-dev  = ["pytest>=7.0", "pyyaml>=6.0"]
+yaml  = ["pyyaml>=6.0"]
+shap  = ["shap>=0.43"]
+rich  = ["rich>=13.0"]
+gds   = ["fprime-gds>=3.0"]
+taste = ["asn1tools>=0.161"]
+onnx  = ["onnx>=1.14", "tf2onnx>=1.15"]
+dev   = ["pytest>=7.0", "pyyaml>=6.0"]
 
 [project.urls]
 Homepage   = "https://github.com/danielnovais-tech/SENTINEL-X"

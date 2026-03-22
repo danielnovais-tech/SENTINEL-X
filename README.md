@@ -852,6 +852,120 @@ provided in [docs/rtos_integration.md](docs/rtos_integration.md).
 
 ---
 
+## Formation-Flying Coordination
+
+`sentinel_x/formation.py` provides explicit geometric formation-keeping and
+distributed consensus for swarms of spacecraft:
+
+```python
+from sentinel_x_advanced import FederatedSwarm, MissionProfile, SafetyMonitor
+from sentinel_x.formation import FormationController, ConsensusProtocol
+
+swarm = FederatedSwarm(num_spacecraft=4, action_dim=4,
+                       mission_profile=MissionProfile(MissionProfile.BALANCED))
+
+# Leader-follower formation (V-shape, 100 m separation)
+fc = FormationController(swarm, formation_type="v", separation_m=100.0,
+                         formation_weight=0.1)
+
+for ep in range(50):
+    reward = fc.train_episode_with_formation(max_steps=200)
+    print(f"ep {ep}: reward={reward:.2f}  "
+          f"coherence={fc.formation_coherence():.2%}")
+
+# Distributed consensus on health estimates
+cp = ConsensusProtocol(n_agents=4, mixing_weight=0.5, topology="ring")
+cp.set_values([1.0, 0.0, 1.0, 0.5])
+final = cp.run(n_steps=20)   # converges to mean: [0.625, 0.625, 0.625, 0.625]
+```
+
+Supported formations: `"line"`, `"v"`, `"diamond"`, `"circular"`.
+Consensus topologies: `"ring"`, `"complete"`, `"star"`.
+See [docs/formation_coordination.md](docs/formation_coordination.md).
+
+---
+
+## Mission Control Integration (NASA F´ / ESA TASTE)
+
+`sentinel_x/mission_control.py` bridges SENTINEL-X to industry-standard
+flight-software stacks.  A local JSON-lines log is always written; the
+GDS/bus forwarding is optional:
+
+```python
+from sentinel_x.mission_control import MissionControlBridge, available_adapters
+print(available_adapters())  # {"fprime": False, "taste": False}
+
+class MyBridge(MissionControlBridge):
+    pass
+
+with MyBridge(log_path="telemetry.jsonl") as bridge:
+    bridge.publish_episode_summary(episode=5, reward=12.3, overrides=1)
+    bridge.send_command("RESET_OVERRIDE_COUNT", {})
+
+# F´ GDS (requires: pip install fprime-gds)
+from sentinel_x.mission_control import FPrimeAdapter
+bridge = FPrimeAdapter(gds_host="127.0.0.1", gds_port=50050)
+
+# ESA TASTE / ASN.1 (requires: pip install asn1tools)
+from sentinel_x.mission_control import TASTEAdapter
+bridge = TASTEAdapter(output_dir="taste_telemetry/")
+```
+
+See [docs/mission_control_integration.md](docs/mission_control_integration.md).
+
+---
+
+## Hardware Deployment Validation
+
+`scripts/hardware_timing_validator.py` verifies that the inference pipeline
+meets real-time timing requirements on the target platform:
+
+```bash
+# Simulation mode (no hardware needed)
+python scripts/hardware_timing_validator.py
+
+# With a real serial MCU
+python scripts/hardware_timing_validator.py --port /dev/ttyUSB0 --runs 500
+```
+
+Output:
+```
+[1] TFLite int8 inference latency
+  ✓ PASS  Inference   median=0.31 ms  p95=0.42 ms  p99=0.51 ms  (budget=10.0 ms)
+[2] State-vector normalisation latency
+  ✓ PASS  Normalisation   p99=0.009 ms  (budget=0.5 ms)
+[3] SafetyMonitor veto latency
+  ✓ PASS  SafetyMonitor   p99=0.005 ms  (budget=0.1 ms)
+Result: ALL TESTS PASSED
+```
+
+See [docs/hardware_deployment_validation.md](docs/hardware_deployment_validation.md).
+
+---
+
+## Operator Dashboard
+
+`scripts/dashboard.py` provides a real-time terminal dashboard for monitoring
+the swarm during training or deployment.  Uses `rich` if installed, otherwise
+falls back to plain text:
+
+```bash
+# Install rich for a colourful TUI (optional)
+pip install rich
+
+# Launch the dashboard (starts a live training session)
+python scripts/dashboard.py --spacecraft 4 --episodes 200
+
+# Plain-text fallback (no rich required)
+python scripts/dashboard.py --plain
+```
+
+The dashboard shows per-spacecraft health, fault counts, last action, mean
+episode reward, safety override count, federated round count, and formation
+coherence (if a `FormationController` is attached).
+
+---
+
 ## Continuous Integration
 
 The repository includes a GitHub Actions CI workflow
@@ -871,41 +985,48 @@ python -m pytest tests/ -v
 
 ```
 SENTINEL-X/
-├── sentinel_x/                       # importable package (new in v0.3)
-│   ├── __init__.py                   # re-exports full public API
-│   ├── config.py                     # YAML/JSON configuration loader
-│   └── formal_verification.py        # Optional Marabou / ERAN integration
-├── hardware/                         # Hardware Abstraction Layer
-│   ├── __init__.py                   # create_hardware_interface() factory
-│   ├── hal.py                        # Abstract base classes (HAL)
-│   ├── sensor_interfaces.py          # Sensor pre-processing layer
-│   ├── rpi_driver.py                 # Raspberry Pi GPIO + UART driver
-│   ├── stm32_driver.py               # STM32 / generic serial MCU driver
-│   └── freertos_task.c               # FreeRTOS inference task (C template)
+├── sentinel_x/                           # importable package
+│   ├── __init__.py                       # re-exports full public API
+│   ├── config.py                         # YAML/JSON configuration loader
+│   ├── formal_verification.py            # Optional Marabou / ERAN integration
+│   ├── formation.py                      # Formation-flying + consensus protocols
+│   └── mission_control.py               # NASA F´ / ESA TASTE adapters
+├── hardware/                             # Hardware Abstraction Layer
+│   ├── __init__.py                       # create_hardware_interface() factory
+│   ├── hal.py                            # Abstract base classes (HAL)
+│   ├── sensor_interfaces.py              # Sensor pre-processing layer
+│   ├── rpi_driver.py                     # Raspberry Pi GPIO + UART driver
+│   ├── stm32_driver.py                   # STM32 / generic serial MCU driver
+│   └── freertos_task.c                   # FreeRTOS inference task (C template)
 ├── scripts/
-│   ├── replay_tflite.py              # embedded deployment / latency benchmark
-│   ├── run_lunar_gateway.py          # full Lunar Gateway experiment cookbook
-│   ├── mcu_emulator.py               # MCU hardware emulator (HIL demo + TCP server)
-│   └── benchmark_inference.py        # TFLite inference latency & memory benchmarker
+│   ├── replay_tflite.py                  # embedded deployment / latency benchmark
+│   ├── run_lunar_gateway.py              # full Lunar Gateway experiment cookbook
+│   ├── mcu_emulator.py                   # MCU hardware emulator (HIL demo + TCP server)
+│   ├── benchmark_inference.py            # TFLite inference latency & memory benchmarker
+│   ├── hardware_timing_validator.py      # Hardware deployment timing validation
+│   └── dashboard.py                      # Real-time operator TUI dashboard
 ├── examples/
-│   └── lunar_gateway.py              # < 1-minute quickstart demo
+│   └── lunar_gateway.py                  # < 1-minute quickstart demo
 ├── docs/
-│   ├── ltl_constraints.md            # How LTL Constraints Work
-│   ├── decision_tree_certification.md # DT certification explainer
-│   ├── custom_mission_tutorial.md    # Step-by-step new mission guide
-│   ├── hardware_integration.md       # Hardware driver guide + wiring diagrams
-│   ├── formal_verification_external.md # Marabou / ERAN integration guide
-│   └── rtos_integration.md           # FreeRTOS / Zephyr deployment guide
+│   ├── ltl_constraints.md                # How LTL Constraints Work
+│   ├── decision_tree_certification.md    # DT certification explainer
+│   ├── custom_mission_tutorial.md        # Step-by-step new mission guide
+│   ├── hardware_integration.md           # Hardware driver guide + wiring diagrams
+│   ├── hardware_deployment_validation.md # Timing validation guide
+│   ├── formal_verification_external.md   # Marabou / ERAN integration guide
+│   ├── rtos_integration.md               # FreeRTOS / Zephyr deployment guide
+│   ├── formation_coordination.md         # Formation-flying + consensus guide
+│   └── mission_control_integration.md   # NASA F´ / ESA TASTE integration guide
 ├── tests/
-│   └── test_sentinel_x.py            # 244+ pytest tests
-├── sentinel_x_advanced.py            # canonical implementation
-├── sentinel_x_config.yaml            # default configuration template
-├── run_experiment.py                 # config-driven experiment runner
-├── pyproject.toml                    # PEP 517 packaging metadata
+│   └── test_sentinel_x.py               # 285+ pytest tests
+├── sentinel_x_advanced.py               # canonical implementation
+├── sentinel_x_config.yaml               # default configuration template
+├── run_experiment.py                     # config-driven experiment runner
+├── pyproject.toml                        # PEP 517 packaging metadata
 ├── requirements.txt
 └── .github/
     └── workflows/
-        └── ci.yml                    # GitHub Actions CI pipeline
+        └── ci.yml                        # GitHub Actions CI pipeline
 ```
 
 ---
@@ -924,12 +1045,15 @@ Additional technical documentation lives in the `docs/` folder:
 
 * [**docs/custom_mission_tutorial.md**](docs/custom_mission_tutorial.md) —
   Step-by-step tutorial: create a new mission scenario from requirements to a
-  fully trained, verified, and exported policy in under 30 minutes (Jupiter
-  flyby CubeSat worked example).
+  fully trained, verified, and exported policy in under 30 minutes.
 
 * [**docs/hardware_integration.md**](docs/hardware_integration.md) —
   Hardware driver guide: wiring diagrams, UART protocol, Raspberry Pi and
   STM32 integration, step-by-step deployment checklist.
+
+* [**docs/hardware_deployment_validation.md**](docs/hardware_deployment_validation.md) —
+  Timing validation: running `hardware_timing_validator.py` on real boards,
+  per-platform results, CI integration example.
 
 * [**docs/formal_verification_external.md**](docs/formal_verification_external.md) —
   Marabou and ERAN integration: installation, ONNX export, property
@@ -939,21 +1063,32 @@ Additional technical documentation lives in the `docs/` folder:
   FreeRTOS and Zephyr RTOS integration: build instructions, memory
   requirements, expected latency, and deployment checklist.
 
+* [**docs/formation_coordination.md**](docs/formation_coordination.md) —
+  Formation-flying: geometry builders, consensus protocol, reward shaping,
+  convergence analysis, integration with `MissionControlBridge`.
+
+* [**docs/mission_control_integration.md**](docs/mission_control_integration.md) —
+  NASA F´ GDS and ESA TASTE integration: installation, channel mapping,
+  custom ASN.1 schema, training-loop integration, F´ component registration.
+
 ---
 
 ## Testing
 
 ```bash
-# Run all 245 tests
+# Run all 285+ tests
 python -m pytest tests/ -v
 
 # Run a specific test class
 python -m pytest tests/ -k TestPPOAgent -v
 
-# Run config / package / deployment script tests only
-python -m pytest tests/ -k "TestPackage or TestConfig or TestReplayTFLite" -v
-
 # Run hardware and formal verification tests
 python -m pytest tests/ -k "TestHardwareHAL or TestFormalVerification" -v
+
+# Run formation and mission control tests
+python -m pytest tests/ -k "TestConsensusProtocol or TestFormationController or TestMissionControlBridge" -v
+
+# Run the timing validator
+python -m pytest tests/ -k "TestHardwareTimingValidator" -v
 ```
 

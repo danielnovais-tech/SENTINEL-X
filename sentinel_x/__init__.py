@@ -39,6 +39,13 @@ Formal verification (external tools – optional)
     MarabouVerifier, ERANVerifier, export_to_onnx, available_verifiers
     (requires ``maraboupy``/``eran`` + ``onnx tf2onnx``; graceful fallback)
 
+Formation-flying coordination
+    ConsensusProtocol, FormationController, FormationGeometry, FormationMetrics
+
+Mission control integration (optional)
+    MissionControlBridge, FPrimeAdapter, TASTEAdapter, available_adapters
+    (requires ``fprime-gds`` / ``asn1tools``; graceful fallback)
+
 Deployment
     export_tflite, export_tflite_int8, extract_decision_tree
     export_decision_tree_rules, dt_fidelity_report
@@ -135,6 +142,16 @@ __all__ = [
     "ERANVerifier",
     "export_to_onnx",
     "available_verifiers",
+    # Formation-flying coordination
+    "ConsensusProtocol",
+    "FormationController",
+    "FormationGeometry",
+    "FormationMetrics",
+    # Mission control integration (optional)
+    "MissionControlBridge",
+    "FPrimeAdapter",
+    "TASTEAdapter",
+    "available_adapters",
 ]
 
 # ---------------------------------------------------------------------------
@@ -145,4 +162,24 @@ from sentinel_x.formal_verification import (  # noqa: F401, E402
     ERANVerifier,
     export_to_onnx,
     available_verifiers,
+)
+
+# ---------------------------------------------------------------------------
+# Formation-flying coordination (always available – no optional deps)
+# ---------------------------------------------------------------------------
+from sentinel_x.formation import (  # noqa: F401, E402
+    ConsensusProtocol,
+    FormationController,
+    FormationGeometry,
+    FormationMetrics,
+)
+
+# ---------------------------------------------------------------------------
+# Mission control integration (lazy import – never fails on import)
+# ---------------------------------------------------------------------------
+from sentinel_x.mission_control import (  # noqa: F401, E402
+    MissionControlBridge,
+    FPrimeAdapter,
+    TASTEAdapter,
+    available_adapters,
 )
