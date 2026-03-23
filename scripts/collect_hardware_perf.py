@@ -375,6 +375,8 @@ def main(argv=None):
                         help="RL training episodes (default 20)")
     parser.add_argument("--max-steps",      type=int, default=100,
                         help="Max steps per episode (default 100)")
+    parser.add_argument("--output",        default=None,
+                        help="JSON output path (alias for --json-out)")
     parser.add_argument("--json-out",      default="hardware_perf_results.json",
                         help="JSON output path")
     parser.add_argument("--md-out",        default="hardware_perf_report.md",
@@ -384,6 +386,10 @@ def main(argv=None):
 
     import platform as _platform
     sys_platform = f"{_platform.system()} {_platform.machine()} Python {_platform.python_version()}"
+
+    # --output is an alias for --json-out
+    if args.output is not None:
+        args.json_out = args.output
 
     _print("SENTINEL-X Hardware Performance Collector", args.quiet)
     _print("=" * 55, args.quiet)

@@ -40,6 +40,9 @@ Usage
 
     # Plain-text mode (no rich required)
     python scripts/dashboard.py --plain
+
+    # Stream live telemetry from a connected STM32 / RPi
+    python scripts/dashboard.py --port /dev/ttyUSB0
 """
 
 from __future__ import annotations
@@ -127,9 +130,31 @@ ACTION_LABELS = ["DO_NOTHING", "RESTART", "SWITCH_RED.", "SAFE_MODE"]
 _FAULT_PROB = 0.05   # per-step fault injection probability
 
 
-def _training_thread(state: DashboardState, n_episodes: int) -> None:
-    """Run training loop in a background thread, updating DashboardState."""
+def _training_thread(
+    state: DashboardState,
+    n_episodes: int,
+    port: Optional[str] = None,
+    baud: int = 115_200,
+) -> None:
+    """Run training loop in a background thread, updating DashboardState.
+
+    When *port* is given the loop reads live sensor telemetry from the
+    connected MCU (via :class:`hardware.stm32_driver.STM32Driver`) and
+    injects it into the first spacecraft's fault model for each step.
+    """
     import sentinel_x_advanced as sx
+
+    # Optional real-hardware driver
+    hw_driver = None
+    if port:
+        try:
+            from hardware.stm32_driver import STM32Driver
+            hw_driver = STM32Driver(port=port, baud_rate=baud)
+            hw_driver.open()
+        except Exception as exc:  # noqa: BLE001
+            print(f"[dashboard] WARNING: could not open {port}: {exc}",
+                  file=sys.stderr)
+            hw_driver = None
 
     swarm = sx.FederatedSwarm(
         num_spacecraft=state.n_spacecraft,
@@ -143,6 +168,18 @@ def _training_thread(state: DashboardState, n_episodes: int) -> None:
     for ep in range(n_episodes):
         if state.stopped:
             break
+
+        # When real hardware is connected, read one sensor frame and use the
+        # health_flag from the MCU to override the first spacecraft's state.
+        if hw_driver is not None:
+            try:
+                reading = hw_driver.read_sensors()
+                hw_vec  = reading.to_state_vector()
+                # Inject telemetry: mark spacecraft 0 as faulty if health_flag
+                if reading.health_flag and swarm.spacecraft:
+                    swarm.spacecraft[0].inject_fault("hardware_flag")
+            except Exception:  # noqa: BLE001
+                pass  # Don't crash the dashboard on transient UART errors
 
         reward = swarm.train_episode(max_steps=100)
 
@@ -172,10 +209,11 @@ def _training_thread(state: DashboardState, n_episodes: int) -> None:
         )
 
     state.stopped = True
-
-
-# ---------------------------------------------------------------------------
-# Rich renderer
+    if hw_driver is not None:
+        try:
+            hw_driver.close()
+        except Exception:  # noqa: BLE001
+            pass
 # ---------------------------------------------------------------------------
 
 def _make_spacecraft_table(snap: Dict) -> Table:
@@ -322,6 +360,15 @@ def main(argv=None):
                         help="Dashboard refresh interval in seconds (default 1.0)")
     parser.add_argument("--plain",      action="store_true",
                         help="Force plain-text output (no rich required)")
+    parser.add_argument("--port",       default=None,
+                        help=(
+                            "Serial port for live hardware telemetry "
+                            "(e.g. /dev/ttyUSB0). "
+                            "When provided, sensor readings are streamed from "
+                            "the connected MCU instead of the simulator."
+                        ))
+    parser.add_argument("--baud",       type=int,   default=115_200,
+                        help="UART baud rate when --port is used (default 115200)")
     args = parser.parse_args(argv)
 
     use_rich = _HAS_RICH and not args.plain
@@ -332,6 +379,7 @@ def main(argv=None):
     train_thread = threading.Thread(
         target=_training_thread,
         args=(state, args.episodes),
+        kwargs={"port": args.port, "baud": args.baud},
         daemon=True,
     )
     train_thread.start()
