@@ -48,6 +48,7 @@
 #include "task.h"
 #include "cmsis_os.h"
 #include "main.h"
+#include <string.h>   /* strnlen */
 
 /* TFLite Micro headers (generated / copied from tflite-micro) */
 #include "tensorflow/lite/micro/micro_interpreter.h"
@@ -81,6 +82,32 @@
 #define UART_REQUEST_BYTE        0x52     /* 'R' */
 #define UART_ACTION_HEADER       0xAA
 
+/* ── Hardware watchdog ────────────────────────────────────────────────────── *
+ * Map SENTINEL_WDT_REFRESH() to your BSP watchdog refresh call.
+ * Example (STM32 IWDG via STM32 HAL):
+ *   extern IWDG_HandleTypeDef hiwdg;
+ *   #define SENTINEL_WDT_REFRESH()  HAL_IWDG_Refresh(&hiwdg)
+ *
+ * The watchdog must be initialised and started before SentinelX_CreateTask().
+ * Recommended timeout: ≥ 200 ms (2× the 100 Hz control-loop tick).
+ * ─────────────────────────────────────────────────────────────────────────── */
+#ifndef SENTINEL_WDT_REFRESH
+#  define SENTINEL_WDT_REFRESH()  /* no-op in simulation / unit-test builds   */
+#endif
+
+/* Maximum number of consecutive watchdog-triggered resets before the system
+ * locks into permanent safe mode and waits for a ground command to resume.  */
+#define SENTINEL_WDT_RESET_LIMIT   5
+
+/* CRC-32 of the model flatbuffer – compute offline before flight:
+ *   python3 -c "
+ *     import zlib, pathlib
+ *     data = pathlib.Path('sentinel_x_model_int8.tflite').read_bytes()
+ *     print(hex(zlib.crc32(data) & 0xFFFFFFFF))
+ *   "
+ * Replace the placeholder with the actual value before flight build.        */
+#define SENTINEL_MODEL_CRC32_EXPECTED  0x00000000U  /* TODO: set before flight */
+
 /* ───────────────────────────── Types ────────────────────────────────────── */
 
 /** 22-byte sensor telemetry frame (same encoding as Python _parse_uart_frame) */
@@ -110,10 +137,94 @@ static TfLiteTensor*             output_tensor = nullptr;
 
 extern UART_HandleTypeDef SENTINEL_UART;
 
+/* Watchdog reset counter – stored in a no-init RAM region so it survives a
+ * soft reset.  Declare the section in your linker script as NOINIT.         */
+__attribute__((section(".noinit")))
+static volatile uint32_t sentinel_wdt_reset_count;
+
+/* Magic value used to detect an uninitialised .noinit region on the very
+ * first power-on (as opposed to a watchdog-triggered reset).                */
+#define SENTINEL_NOINIT_MAGIC  0xDEADBEEFUL
+__attribute__((section(".noinit")))
+static volatile uint32_t sentinel_noinit_magic;
+
 /* ───────────────────────────── Helpers ──────────────────────────────────── */
 
 /**
- * @brief  Normalise raw sensor values into the 11-dim state vector.
+ * @brief  CRC-32 (ISO 3309 / Ethernet) computed in software.
+ *
+ * If the STM32 hardware CRC unit is available, replace this with an
+ * HAL_CRC_Calculate() call for a significant speed-up.
+ *
+ * @param  data   Pointer to the data buffer.
+ * @param  length Number of bytes to process.
+ * @return 32-bit CRC.
+ */
+static uint32_t crc32_sw(const uint8_t *data, uint32_t length)
+{
+    uint32_t crc = 0xFFFFFFFFUL;
+    while (length--) {
+        crc ^= (uint32_t)(*data++);
+        for (int bit = 0; bit < 8; ++bit)
+            crc = (crc >> 1) ^ (0xEDB88320UL & -(crc & 1));
+    }
+    return crc ^ 0xFFFFFFFFUL;
+}
+
+/**
+ * @brief  Verify the TFLite model flatbuffer integrity at boot.
+ *
+ * Computes CRC-32 over the model byte array and compares it to the
+ * compile-time constant SENTINEL_MODEL_CRC32_EXPECTED.  Returns pdFALSE
+ * if the value is still the placeholder (0x00000000) so that developers
+ * are reminded to set the correct CRC before a flight build.
+ *
+ * @return pdTRUE if the model is intact and the CRC has been configured.
+ */
+static BaseType_t sentinel_verify_model_crc(void)
+{
+    /* Refuse to proceed with the unconfigured placeholder CRC */
+    if (SENTINEL_MODEL_CRC32_EXPECTED == 0x00000000UL)
+        return pdFALSE;
+
+    uint32_t actual = crc32_sw(
+        (const uint8_t *)sentinel_x_model_int8_data,
+        (uint32_t)sentinel_x_model_int8_data_len);
+
+    return (actual == SENTINEL_MODEL_CRC32_EXPECTED) ? pdTRUE : pdFALSE;
+}
+
+/**
+ * @brief  Enter permanent safe mode.
+ *
+ * Disables non-critical subsystems, emits a distress beacon over UART,
+ * and spins forever waiting for a ground-commanded reset.  The hardware
+ * watchdog is still refreshed so that the system does not reset again
+ * while waiting for ground contact.
+ *
+ * @param  reason  Short ASCII string logged over UART (max 16 chars).
+ */
+static void __attribute__((noreturn)) sentinel_enter_safe_mode(const char *reason)
+{
+    /* TODO: disable non-critical peripherals (payload, heaters, actuators) */
+    /* TODO: command attitude control to minimum-power survival mode         */
+
+    /* Emit a distress beacon every 5 s so ground can detect the anomaly */
+    uint8_t beacon[20];
+    beacon[0] = 0xFF;   /* SAFE_MODE marker */
+    beacon[1] = (uint8_t)strnlen(reason, 16);
+    for (int i = 0; i < 16; ++i)
+        beacon[2 + i] = (i < beacon[1]) ? (uint8_t)reason[i] : 0;
+    beacon[18] = (uint8_t)(sentinel_wdt_reset_count & 0xFF);
+    beacon[19] = 0xFE;  /* end marker */
+
+    for (;;) {
+        HAL_UART_Transmit(&SENTINEL_UART, beacon, sizeof(beacon), 100);
+        /* Keep refreshing the watchdog – we are intentionally alive */
+        SENTINEL_WDT_REFRESH();
+        vTaskDelay(pdMS_TO_TICKS(5000));
+    }
+}
  * @param  frame   Pointer to a decoded SentinelXFrame.
  * @param  state   Output buffer (11 floats).
  */
@@ -180,10 +291,18 @@ static int argmax_f(const float *arr, int n)
 
 /**
  * @brief  Load the TFLite model and allocate tensors.
+ *
+ * Performs a CRC-32 integrity check on the model flatbuffer before
+ * attempting to load it, guarding against flash corruption (SEU / MBU).
+ *
  * @return pdTRUE on success, pdFALSE on failure.
  */
 static BaseType_t sentinel_tflite_init(void)
 {
+    /* ── Model integrity check (CRC-32 over flash) ──────────────────────── */
+    if (sentinel_verify_model_crc() != pdTRUE)
+        return pdFALSE;
+
     tflite::InitializeTarget();
 
     const tflite::Model *model = tflite::GetModel(sentinel_x_model_int8_data);
@@ -217,20 +336,45 @@ static BaseType_t sentinel_tflite_init(void)
  * @brief  SENTINEL-X inference task (runs at configTICK_RATE_HZ).
  *
  * Loop:
- *   1. Read sensor frame from host / sensors.
- *   2. Build normalised state vector.
- *   3. Run TFLite inference.
- *   4. Apply SafetyMonitor vetoes.
- *   5. Transmit action to host and drive actuators.
+ *   1. Refresh the hardware watchdog (10 Hz – every control-loop tick).
+ *   2. Read sensor frame from host / sensors.
+ *   3. Build normalised state vector.
+ *   4. Run TFLite inference.
+ *   5. Apply SafetyMonitor vetoes.
+ *   6. Transmit action to host and drive actuators.
+ *
+ * Watchdog reset tracking
+ * -----------------------
+ * The reset counter is kept in a .noinit RAM region that survives a soft
+ * reset.  On the very first power-on (detected via a magic word) the counter
+ * is initialised to zero.  Each time the task starts after a watchdog reset
+ * the counter is incremented; once it reaches SENTINEL_WDT_RESET_LIMIT the
+ * system enters permanent safe mode and waits for a ground command.
  */
 void SentinelX_InferenceTask(void *pvParameters)
 {
     (void)pvParameters;
 
-    if (sentinel_tflite_init() != pdTRUE) {
-        /* Hang in safe mode if model fails to load */
-        for (;;) vTaskDelay(pdMS_TO_TICKS(1000));
+    /* ── Watchdog reset counter initialisation ────────────────────────── */
+    if (sentinel_noinit_magic != SENTINEL_NOINIT_MAGIC) {
+        /* First power-on: initialise the .noinit region */
+        sentinel_noinit_magic    = SENTINEL_NOINIT_MAGIC;
+        sentinel_wdt_reset_count = 0;
+    } else {
+        /* Surviving a reset (watchdog or software) – increment counter */
+        sentinel_wdt_reset_count++;
     }
+
+    if (sentinel_wdt_reset_count >= SENTINEL_WDT_RESET_LIMIT)
+        sentinel_enter_safe_mode("wdt_limit");
+
+    /* ── TFLite initialisation (includes CRC-32 model integrity check) ── */
+    if (sentinel_tflite_init() != pdTRUE)
+        sentinel_enter_safe_mode("tflite_init");
+
+    /* Once inference is up and running, reset the watchdog counter so that
+     * a single isolated reset does not permanently lock the system.        */
+    sentinel_wdt_reset_count = 0;
 
     uint8_t      rx_buf[UART_FRAME_LEN];
     SentinelXFrame frame;
@@ -240,6 +384,12 @@ void SentinelX_InferenceTask(void *pvParameters)
 
     for (;;)
     {
+        /* ── 0. Refresh hardware watchdog ──────────────────────────────── *
+         * This must be the first statement in every loop iteration.        *
+         * If execution never reaches here (e.g., the inference hangs),    *
+         * the watchdog will expire and reset the CPU.                      */
+        SENTINEL_WDT_REFRESH();
+
         /* ── 1. Wait for a request byte from the host ── */
         uint8_t req;
         if (HAL_UART_Receive(&SENTINEL_UART, &req, 1, 20) == HAL_OK

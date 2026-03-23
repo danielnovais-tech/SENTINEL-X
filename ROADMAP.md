@@ -41,21 +41,35 @@ experimental sections to the target venue's page limit and style guidelines.
 **Goal:** Port the trained policy to a flight computer and run in-orbit (or
 flat-sat) fault-recovery experiments.
 
-**Steps:**
+**Detailed guide:** [`docs/flight_deployment_roadmap.md`](docs/flight_deployment_roadmap.md)
+
+**Quick-start steps:**
 1. Export the int8 TFLite flatbuffer:
    ```bash
    python run_experiment.py --scenario lunar_gateway --episodes 100
    # → sentinel_x_model_int8.tflite
    ```
-2. Flash to target MCU using the FreeRTOS task template:
+2. Compute and set the model CRC before the flight build:
+   ```bash
+   python3 -c "
+   import zlib, pathlib
+   data = pathlib.Path('sentinel_x_model_int8.tflite').read_bytes()
+   print(f'#define SENTINEL_MODEL_CRC32_EXPECTED  0x{zlib.crc32(data)&0xFFFFFFFF:08X}U')
+   "
+   # Copy output into hardware/freertos_task.c
+   ```
+3. Map `SENTINEL_WDT_REFRESH()` to your BSP watchdog refresh call
+   in your project header.
+4. Flash to target MCU using the FreeRTOS task template:
    `hardware/freertos_task.c` + TFLite Micro.
-3. Integrate with the mission's telemetry/command bus:
-   - NASA F´ adapter: `docs/mission_control_integration.md`
+5. Integrate with the mission's telemetry/command bus:
+   - NASA F′ adapter: `docs/mission_control_integration.md`
    - ESA TASTE adapter: same doc, TASTE section.
-4. Run a flat-sat regression using `scripts/mcu_emulator.py` before flight.
+6. Run a flat-sat regression using `scripts/mcu_emulator.py` before flight.
 
-**Guide:** [`docs/hardware_integration.md`](docs/hardware_integration.md) and
-[`docs/hardware_deployment.md`](docs/hardware_deployment.md).
+**Guides:** [`docs/hardware_integration.md`](docs/hardware_integration.md),
+[`docs/hardware_deployment.md`](docs/hardware_deployment.md),
+[`docs/flight_deployment_roadmap.md`](docs/flight_deployment_roadmap.md).
 
 ---
 

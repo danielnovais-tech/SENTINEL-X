@@ -1094,6 +1094,12 @@ Additional technical documentation lives in the `docs/` folder:
   Long-term autonomy: online policy fine-tuning, mission planning integration,
   and human-in-the-loop decision support with operator feedback.
 
+* [**docs/flight_deployment_roadmap.md**](docs/flight_deployment_roadmap.md) —
+  End-to-end flight deployment guide: hardware selection (STM32H7-R, SAMRH71),
+  software hardening (hardware watchdog, CRC-32 model integrity, safe mode),
+  F′/TASTE/cFS integration, V&V (environmental, fault injection, formal),
+  and 7-milestone deployment plan.
+
 * [**ROADMAP.md**](ROADMAP.md) —
   10-item enhancement roadmap: publication venues, CubeSat deployment,
   advanced RL algorithms, extended formal verification, HIL improvements,

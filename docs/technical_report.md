@@ -315,10 +315,11 @@ sentinel_x/          # importable Python package
 hardware/            # HAL, RPi driver, STM32 driver, FreeRTOS task
 scripts/             # collect_hardware_perf, dashboard, timing validator, …
 notebooks/           # getting_started.ipynb tutorial
-docs/                # 12 technical guides + this report
+docs/                # 13 technical guides + this report
   hardware_deployment.md       # step-by-step RPi + STM32 guide
   hardware_integration.md      # wiring, protocol, and embedded deployment
   hardware_performance_results.md  # reference timing tables
+  flight_deployment_roadmap.md # end-to-end flight deployment guide
   benchmarking.md              # comparison against rule-based and RLLib
   continuous_learning.md       # long-term autonomy and human-in-the-loop
 ROADMAP.md           # 10-item enhancement roadmap with implementation guides
