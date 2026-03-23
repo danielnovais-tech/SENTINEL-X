@@ -1,0 +1,43 @@
+cff-version: 1.2.0
+message: >-
+  If you use SENTINEL-X in academic or research work, please cite it using
+  the metadata below.
+type: software
+title: "SENTINEL-X: Federated Reinforcement Learning for Autonomous Spacecraft Fault Detection and Recovery"
+authors:
+  - family-names: Novais
+    given-names: Daniel
+    orcid: ""
+    affiliation: ""
+repository-code: "https://github.com/danielnovais-tech/SENTINEL-X"
+url: "https://github.com/danielnovais-tech/SENTINEL-X"
+abstract: >-
+  SENTINEL-X is an open-source platform for autonomous fault detection,
+  isolation, and recovery (FDIR) in spacecraft swarms.  The system combines
+  deep reinforcement learning (DRL) with federated model aggregation,
+  LTL safety constraints, formal policy verification, TFLite int8 deployment
+  on Cortex-M microcontrollers, leader-follower formation control, distributed
+  consensus protocols, and adapters for NASA F Prime and ESA TASTE
+  mission-control stacks.
+keywords:
+  - reinforcement-learning
+  - spacecraft
+  - fault-detection
+  - federated-learning
+  - embedded-ai
+  - space-autonomy
+  - formation-flying
+  - mission-control
+license: Apache-2.0
+version: "0.3.0"
+date-released: "2025-01-01"
+preferred-citation:
+  type: software
+  title: "SENTINEL-X: Federated Reinforcement Learning for Autonomous Spacecraft Fault Detection and Recovery"
+  authors:
+    - family-names: Novais
+      given-names: Daniel
+  year: 2025
+  url: "https://github.com/danielnovais-tech/SENTINEL-X"
+  license: Apache-2.0
+  version: "0.3.0"

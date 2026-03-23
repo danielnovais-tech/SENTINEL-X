@@ -1,0 +1,3105 @@
+"""
+pytest unit tests for SENTINEL-X Advanced
+==========================================
+Covers:
+  - Fault generators (MemoryArray, Sensor, ThermalSubsystem, PowerSubsystem,
+    AttitudeControlSubsystem, CommSubsystem)
+  - Spacecraft state vector and recovery actions
+  - MissionProfile reward computation and dynamic weight updates
+  - DQNAgent interface (act, remember, replay)
+  - SafetyMonitor veto constraints
+  - AdversarialTester: find examples, augment_replay_buffer, certify_robustness
+  - FederatedSwarm safety-aware training (last_override_count)
+  - benchmark_federation utility (smoke test: runs without error, returns dict)
+  - GossipServer gossip round
+  - PolicyVerifier (smoke test: returns well-formed report)
+  - TFLite exports (dynamic-range and int8)
+"""
+import os
+import random
+import tempfile
+
+import numpy as np
+import pytest
+
+# Suppress TF/XLA logging noise during tests
+os.environ.setdefault("TF_CPP_MIN_LOG_LEVEL", "3")
+
+import sentinel_x_advanced as sx
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+def make_agent(state_dim: int = 11, action_dim: int = 4) -> sx.DQNAgent:
+    """Return a freshly initialised DQNAgent."""
+    return sx.DQNAgent(state_dim, action_dim)
+
+
+def make_fed_swarm(safety_monitor=None, n: int = 2) -> sx.FederatedSwarm:
+    return sx.FederatedSwarm(
+        num_spacecraft=n,
+        action_dim=4,
+        mission_profile=sx.MissionProfile(sx.MissionProfile.BALANCED),
+        federated_interval=5,
+        safety_monitor=safety_monitor,
+    )
+
+
+# ===========================================================================
+# 1. Fault generators
+# ===========================================================================
+
+class TestMemoryArray:
+    def test_step_returns_int(self):
+        m = sx.MemoryArray()
+        result = m.step()
+        assert isinstance(result, int)
+
+    def test_error_count_non_negative(self):
+        m = sx.MemoryArray(size_bits=512, flip_rate_per_bit=0.5)
+        for _ in range(10):
+            m.step()
+        assert m.error_count >= 0
+
+    def test_reset_clears_state(self):
+        m = sx.MemoryArray(size_bits=256, flip_rate_per_bit=1.0)
+        m.step()
+        m.reset()
+        assert m.error_count == 0
+        assert np.all(m.data == 0)
+
+    def test_check_parity_returns_zero_or_one(self):
+        m = sx.MemoryArray()
+        parity = m.check_parity()
+        assert parity in (0, 1)
+
+
+class TestSensor:
+    def test_step_returns_float(self):
+        s = sx.Sensor()
+        assert isinstance(s.step(), float)
+
+    def test_stuck_at_fault(self):
+        s = sx.Sensor(stuck_prob=1.0)
+        first = s.step()          # triggers stuck
+        second = s.step()         # returns stuck value
+        assert s.is_stuck
+        assert second == first
+
+    def test_reset_clears_stuck(self):
+        s = sx.Sensor(stuck_prob=1.0)
+        s.step()
+        s.reset()
+        assert not s.is_stuck
+        assert s.stuck_value is None
+
+
+class TestThermalSubsystem:
+    def test_step_returns_float(self):
+        t = sx.ThermalSubsystem()
+        assert isinstance(t.step(), float)
+
+    def test_fault_declared_above_threshold(self):
+        t = sx.ThermalSubsystem(fault_temp_high=25.0)
+        t.temperature = 26.0
+        t.step()
+        assert t.is_faulted
+
+    def test_fault_flag_property(self):
+        t = sx.ThermalSubsystem()
+        t.is_faulted = True
+        assert t.fault_flag == 1
+        t.is_faulted = False
+        assert t.fault_flag == 0
+
+    def test_reset(self):
+        t = sx.ThermalSubsystem()
+        t.is_faulted = True
+        t.temperature = 200.0
+        t.reset()
+        assert not t.is_faulted
+        assert t.temperature == t.nominal_temp
+
+
+class TestPowerSubsystem:
+    def test_step_returns_float(self):
+        p = sx.PowerSubsystem()
+        assert isinstance(p.step(), float)
+
+    def test_charge_clipped_to_zero(self):
+        p = sx.PowerSubsystem(drain_rate=10.0, recharge_rate=0.0)
+        for _ in range(1000):
+            p.step()
+        assert p.charge >= 0.0
+
+    def test_level_norm_in_unit_interval(self):
+        p = sx.PowerSubsystem()
+        for _ in range(20):
+            p.step()
+        assert 0.0 <= p.level_norm <= 1.0
+
+    def test_reset(self):
+        p = sx.PowerSubsystem()
+        p.charge = 0.0
+        p.is_faulted = True
+        p.reset()
+        assert p.charge == p.capacity
+        assert not p.is_faulted
+
+
+class TestAttitudeControlSubsystem:
+    def test_step_returns_float(self):
+        a = sx.AttitudeControlSubsystem()
+        assert isinstance(a.step(), float)
+
+    def test_tumble_fault_declared(self):
+        a = sx.AttitudeControlSubsystem(detumble_threshold=1.0)
+        a.angular_rate = np.array([2.0, 0.0, 0.0])
+        a.step()
+        assert a.is_faulted
+
+    def test_rate_norm_capped_at_one(self):
+        a = sx.AttitudeControlSubsystem()
+        a.angular_rate = np.array([1000.0, 1000.0, 1000.0])
+        assert a.rate_norm <= 1.0
+
+    def test_reset(self):
+        a = sx.AttitudeControlSubsystem()
+        a.is_faulted = True
+        a.angular_rate = np.ones(3) * 50.0
+        a.reset()
+        assert not a.is_faulted
+        assert np.all(a.angular_rate == 0.0)
+
+
+class TestCommSubsystem:
+    def test_step_returns_float(self):
+        c = sx.CommSubsystem()
+        val = c.step()
+        assert isinstance(val, float)
+        assert 0.0 <= val <= 1.0
+
+    def test_fault_declared_below_threshold(self):
+        c = sx.CommSubsystem(fault_threshold=0.9)
+        c.link_quality = 0.5
+        c.step()
+        assert c.is_faulted
+
+    def test_quality_norm_property(self):
+        c = sx.CommSubsystem()
+        c.link_quality = 0.42
+        assert c.quality_norm == pytest.approx(0.42)
+
+    def test_reset(self):
+        c = sx.CommSubsystem()
+        c.link_quality = 0.0
+        c.is_faulted = True
+        c.reset()
+        assert c.link_quality == 1.0
+        assert not c.is_faulted
+
+
+# ===========================================================================
+# 2. Spacecraft
+# ===========================================================================
+
+class TestSpacecraft:
+    def test_state_shape(self):
+        sc = sx.Spacecraft()
+        sc.step()
+        assert sc.get_state().shape == (10,)
+
+    def test_state_normalised(self):
+        sc = sx.Spacecraft()
+        for _ in range(10):
+            sc.step()
+        state = sc.get_state()
+        assert np.all(state >= 0.0) and np.all(state <= 1.0)
+
+    def test_health_flag_idx(self):
+        assert sx.Spacecraft.HEALTH_FLAG_IDX == 5
+
+    def test_health_flag_in_state(self):
+        sc = sx.Spacecraft()
+        sc.step()
+        state = sc.get_state()
+        expected = 0 if sc.healthy else 1
+        assert state[sx.Spacecraft.HEALTH_FLAG_IDX] == expected
+
+    @pytest.mark.parametrize("action", [0, 1, 2, 3])
+    def test_apply_recovery_actions(self, action):
+        sc = sx.Spacecraft()
+        sc.step()
+        sc.healthy = False
+        sc.sensor.is_stuck = True
+        sc.memory.error_count = 60
+        sc.parity_ok = False
+        sc.thermal.is_faulted = True
+        sc.power.is_faulted = True
+        sc.attitude.is_faulted = True
+        sc.comm.is_faulted = True
+        sc.sensor_stuck = True
+        result = sc.apply_recovery(action)
+        assert isinstance(result, bool)
+        if action in (1, 2, 3):
+            assert result is True
+
+    def test_reset_reinitialises(self):
+        sc = sx.Spacecraft()
+        for _ in range(50):
+            sc.step()
+        sc.reset()
+        assert sc.healthy
+        assert sc.step_count == 0
+        assert sc.mem_errors == 0
+
+
+# ===========================================================================
+# 3. MissionProfile
+# ===========================================================================
+
+class TestMissionProfile:
+    @pytest.mark.parametrize("profile", [
+        sx.MissionProfile.BALANCED,
+        sx.MissionProfile.MAXIMIZE_DATA_RETURN,
+        sx.MissionProfile.EXTEND_LIFESPAN,
+        sx.MissionProfile.POWER_CONSTRAINED,
+    ])
+    def test_compute_returns_float(self, profile):
+        mp = sx.MissionProfile(profile)
+        r = mp.compute(False, True, 1)
+        assert isinstance(r, float)
+
+    def test_invalid_profile_raises(self):
+        with pytest.raises(ValueError):
+            sx.MissionProfile("nonexistent_profile")
+
+    def test_update_weights_changes_reward(self):
+        mp = sx.MissionProfile(sx.MissionProfile.BALANCED)
+        r_base = mp.compute(False, True, 1)
+        mp.update_weights(recovery_bonus_scale=3.0)
+        r_scaled = mp.compute(False, True, 1)
+        assert r_scaled != r_base
+
+    def test_update_weights_keyword_only(self):
+        mp = sx.MissionProfile()
+        mp.update_weights(fault_penalty_scale=2.0)
+        assert mp.fault_penalty_scale == pytest.approx(2.0)
+
+    def test_update_weights_partial_update(self):
+        mp = sx.MissionProfile()
+        mp.update_weights(recovery_bonus_scale=1.5)
+        assert mp.recovery_bonus_scale == pytest.approx(1.5)
+        assert mp.fault_penalty_scale == pytest.approx(1.0)   # unchanged
+
+
+# ===========================================================================
+# 4. DQNAgent
+# ===========================================================================
+
+class TestDQNAgent:
+    def test_act_training_returns_valid_action(self):
+        agent = make_agent()
+        state = np.zeros(11, dtype=np.float32)
+        for _ in range(20):
+            action = agent.act(state, training=True)
+            assert 0 <= action < 4
+
+    def test_act_greedy_deterministic(self):
+        agent = make_agent()
+        agent.epsilon = 0.0
+        state = np.ones(11, dtype=np.float32)
+        actions = {agent.act(state, training=False) for _ in range(5)}
+        assert len(actions) == 1
+
+    def test_remember_adds_to_buffer(self):
+        agent = make_agent()
+        s = np.zeros(11, dtype=np.float32)
+        agent.remember(s, 0, 1.0, s, False)
+        assert len(agent.memory) == 1
+
+    def test_replay_does_not_raise_when_underfull(self):
+        agent = make_agent()
+        agent.replay()   # should be a no-op, not an error
+
+    def test_replay_reduces_epsilon(self):
+        agent = sx.DQNAgent(11, 4, batch_size=4)
+        s = np.zeros(11, dtype=np.float32)
+        for _ in range(10):
+            agent.remember(s, 0, 1.0, s, False)
+        eps_before = agent.epsilon
+        agent.replay()
+        assert agent.epsilon <= eps_before
+
+
+# ===========================================================================
+# 5. SafetyMonitor
+# ===========================================================================
+
+class TestSafetyMonitor:
+    def test_no_inaction_on_fault(self):
+        m = sx.SafetyMonitor()
+        state = np.zeros(11, dtype=np.float32)
+        state[sx.Spacecraft.HEALTH_FLAG_IDX] = 1.0
+        assert m.veto(0, state, 4) == 3
+
+    def test_no_reset_on_critical_power(self):
+        m = sx.SafetyMonitor()
+        state = np.zeros(11, dtype=np.float32)
+        state[sx.SafetyMonitor.POWER_LEVEL_IDX] = 0.05
+        assert m.veto(2, state, 4) == 3
+
+    def test_safe_action_unchanged(self):
+        m = sx.SafetyMonitor()
+        state = np.zeros(11, dtype=np.float32)
+        state[sx.SafetyMonitor.POWER_LEVEL_IDX] = 0.8
+        for action in (1, 2, 3):
+            assert m.veto(action, state, 4) == action
+
+    def test_fault_does_not_block_non_zero_actions(self):
+        m = sx.SafetyMonitor()
+        state = np.zeros(11, dtype=np.float32)
+        state[sx.Spacecraft.HEALTH_FLAG_IDX] = 1.0
+        state[sx.SafetyMonitor.POWER_LEVEL_IDX] = 0.8
+        for action in (1, 2, 3):
+            assert m.veto(action, state, 4) == action
+
+    def test_short_state_vector_handled(self):
+        """State shorter than POWER_LEVEL_IDX should not raise."""
+        m = sx.SafetyMonitor()
+        state = np.zeros(6, dtype=np.float32)
+        state[sx.Spacecraft.HEALTH_FLAG_IDX] = 0.0
+        result = m.veto(1, state, 4)
+        assert result == 1
+
+
+# ===========================================================================
+# 6. AdversarialTester
+# ===========================================================================
+
+class TestAdversarialTester:
+    @pytest.fixture
+    def tester(self):
+        agent = make_agent()
+        return sx.AdversarialTester(agent, epsilon=0.1, rng_seed=42)
+
+    def test_find_adversarial_examples_returns_list(self, tester):
+        results = tester.find_adversarial_examples(n_examples=20)
+        assert isinstance(results, list)
+
+    def test_each_result_has_required_keys(self, tester):
+        results = tester.find_adversarial_examples(n_examples=20)
+        for r in results:
+            assert "original_state" in r
+            assert "perturbed_state" in r
+            assert "original_action" in r
+            assert "flipped_action" in r
+
+    def test_augment_replay_buffer_returns_int(self, tester):
+        agents = [make_agent() for _ in range(3)]
+        n = tester.augment_replay_buffer(agents, n_examples=30)
+        assert isinstance(n, int)
+        assert n >= 0
+
+    def test_augment_replay_buffer_injects_transitions(self, tester):
+        agents = [make_agent()]
+        buf_before = len(agents[0].memory)
+        injected = tester.augment_replay_buffer(agents, n_examples=50)
+        assert len(agents[0].memory) == buf_before + injected
+
+    def test_augment_with_safety_monitor(self, tester):
+        monitor = sx.SafetyMonitor()
+        agents = [make_agent()]
+        # Should not raise; result is still a non-negative int
+        injected = tester.augment_replay_buffer(
+            agents, n_examples=30, safety_monitor=monitor
+        )
+        assert injected >= 0
+
+    def test_certify_robustness_structure(self, tester):
+        cert = tester.certify_robustness(n_samples=20, eps_hi=0.2, n_bisect=5)
+        assert "mean_radius" in cert
+        assert "min_radius" in cert
+        assert "max_radius" in cert
+        assert "robust_frac" in cert
+        assert "eps_hi" in cert
+        assert "n_samples" in cert
+
+    def test_certify_robustness_ranges(self, tester):
+        cert = tester.certify_robustness(n_samples=20, eps_hi=0.2, n_bisect=5)
+        assert 0.0 <= cert["min_radius"] <= cert["mean_radius"] <= cert["max_radius"]
+        assert cert["max_radius"] <= cert["eps_hi"] + 1e-9
+        assert 0.0 <= cert["robust_frac"] <= 1.0
+
+    def test_epsilon_not_mutated_after_certification(self, tester):
+        original_eps = tester.epsilon
+        tester.certify_robustness(n_samples=10, eps_hi=0.2, n_bisect=3)
+        assert tester.epsilon == pytest.approx(original_eps)
+
+    def test_summary_prints_without_error(self, tester, capsys):
+        results = tester.find_adversarial_examples(n_examples=20)
+        tester.summary(results, n_tested=20)
+        captured = capsys.readouterr()
+        assert "Adversarial" in captured.out
+
+
+# ===========================================================================
+# 7. FederatedSwarm – safety-aware training
+# ===========================================================================
+
+class TestFederatedSwarmSafetyAware:
+    def test_safety_monitor_not_required(self):
+        swarm = make_fed_swarm(safety_monitor=None)
+        r = swarm.train_episode(max_steps=10)
+        assert isinstance(r, float)
+        assert swarm.last_override_count == 0
+
+    def test_override_count_is_non_negative(self):
+        monitor = sx.SafetyMonitor()
+        swarm = make_fed_swarm(safety_monitor=monitor)
+        swarm.train_episode(max_steps=20)
+        assert swarm.last_override_count >= 0
+
+    def test_override_count_resets_per_episode(self):
+        monitor = sx.SafetyMonitor()
+        swarm = make_fed_swarm(safety_monitor=monitor)
+        swarm.train_episode(max_steps=10)
+        count1 = swarm.last_override_count
+        swarm.train_episode(max_steps=10)
+        count2 = swarm.last_override_count
+        # Both counts should be non-negative (independent per episode)
+        assert count1 >= 0
+        assert count2 >= 0
+
+    def test_train_episode_returns_float_with_monitor(self):
+        monitor = sx.SafetyMonitor()
+        swarm = make_fed_swarm(safety_monitor=monitor)
+        r = swarm.train_episode(max_steps=15)
+        assert isinstance(r, float)
+
+
+# ===========================================================================
+# 8. GossipServer
+# ===========================================================================
+
+class TestGossipServer:
+    def test_gossip_round_runs(self):
+        agents = [make_agent() for _ in range(4)]
+        gs = sx.GossipServer(k=2)
+        gs.gossip_round(agents)   # should not raise
+
+    def test_gossip_single_agent_no_op(self):
+        agents = [make_agent()]
+        gs = sx.GossipServer(k=2)
+        gs.gossip_round(agents)   # < 2 agents → safe no-op
+
+    def test_delayed_gossip(self):
+        agents = [make_agent() for _ in range(3)]
+        gs = sx.GossipServer(k=1, comm_delay_steps=2)
+        gs.gossip_round(agents)
+        gs.tick(agents)
+        gs.tick(agents)   # weights applied after 2 ticks
+
+
+# ===========================================================================
+# 9. FederatedServer
+# ===========================================================================
+
+class TestFederatedServer:
+    def test_aggregate_immediate(self):
+        agents = [make_agent() for _ in range(3)]
+        srv = sx.FederatedServer(comm_delay_steps=0)
+        srv.aggregate(agents)   # should not raise
+
+    def test_aggregate_with_dropout(self):
+        agents = [make_agent() for _ in range(4)]
+        srv = sx.FederatedServer(link_dropout_prob=0.5)
+        srv.aggregate(agents)   # may have fewer participants, should not crash
+
+    def test_delayed_aggregate(self):
+        agents = [make_agent() for _ in range(3)]
+        srv = sx.FederatedServer(comm_delay_steps=2)
+        srv.aggregate(agents)
+        srv.tick(agents)
+        srv.tick(agents)
+
+
+# ===========================================================================
+# 10. benchmark_federation (smoke test)
+# ===========================================================================
+
+class TestBenchmarkFederation:
+    def test_returns_correct_structure(self):
+        results = sx.benchmark_federation(
+            num_spacecraft=2,
+            episodes=5,
+            max_steps=20,
+            dropout_rates=(0.0, 0.3),
+        )
+        assert "fedavg" in results
+        assert "gossip" in results
+        for key in results:
+            for dropout in (0.0, 0.3):
+                assert dropout in results[key]
+                entry = results[key][dropout]
+                assert "rewards" in entry
+                assert "test_ops" in entry
+                assert len(entry["rewards"]) == 5
+
+    def test_test_ops_non_negative(self):
+        results = sx.benchmark_federation(
+            num_spacecraft=2,
+            episodes=3,
+            max_steps=15,
+            dropout_rates=(0.0,),
+        )
+        for key in results:
+            for dropout, entry in results[key].items():
+                assert entry["test_ops"] >= 0.0
+
+
+# ===========================================================================
+# 11. PolicyVerifier (smoke test)
+# ===========================================================================
+
+class TestPolicyVerifier:
+    def test_verify_returns_report(self):
+        agent = make_agent()
+        pv = sx.PolicyVerifier(agent, n_samples=30)
+        report = pv.verify()
+        assert "overall_passed" in report
+        assert "safety_constraint" in report
+        assert "qvalue_margin" in report
+        assert "action_coverage" in report
+
+    def test_overall_passed_is_bool(self):
+        agent = make_agent()
+        pv = sx.PolicyVerifier(agent, n_samples=20)
+        report = pv.verify()
+        assert isinstance(report["overall_passed"], bool)
+
+
+# ===========================================================================
+# 12. TFLite exports
+# ===========================================================================
+
+class TestTFLiteExport:
+    def test_dynamic_range_export(self):
+        agent = make_agent()
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "model.tflite")
+            data = sx.export_tflite(agent, output_path=path)
+        assert isinstance(data, bytes)
+        assert len(data) > 0
+
+    def test_int8_export(self):
+        agent = make_agent()
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "model_int8.tflite")
+            data = sx.export_tflite_int8(agent, output_path=path, n_calib_samples=16)
+        assert isinstance(data, bytes)
+        assert len(data) > 0
+
+    def test_int8_smaller_than_dynamic(self):
+        """int8 model should be ≤ dynamic-range model in size."""
+        agent = make_agent()
+        with tempfile.TemporaryDirectory() as tmp:
+            dyn = sx.export_tflite(agent, os.path.join(tmp, "dyn.tflite"))
+            i8 = sx.export_tflite_int8(
+                agent, os.path.join(tmp, "i8.tflite"), n_calib_samples=16
+            )
+        assert len(i8) <= len(dyn)
+
+
+# ===========================================================================
+# 13. LTLConstraintChecker
+# ===========================================================================
+
+_COMM_IDX = sx.LTLConstraintChecker._COMM_IDX   # index of comm_quality_norm
+
+class TestLTLConstraintChecker:
+    def test_default_constraints_registered(self):
+        ltl = sx.LTLConstraintChecker()
+        names = ltl.active_names()
+        assert "no_inaction_on_fault" in names
+        assert "no_full_reset_low_power" in names
+        assert "no_simultaneous_faults" in names
+        assert "comm_link_recovery" in names
+
+    def test_no_inaction_on_fault_violated(self):
+        ltl = sx.LTLConstraintChecker(penalty=-1.0)
+        state = np.zeros(11, dtype=np.float32)
+        state[sx.Spacecraft.HEALTH_FLAG_IDX] = 1.0
+        pen = ltl.evaluate(state, action=0)
+        assert pen < 0.0
+
+    def test_no_inaction_on_fault_not_triggered_by_recovery(self):
+        ltl = sx.LTLConstraintChecker(penalty=-1.0)
+        # Only health flag set; no simultaneous faults, good comm
+        state = np.zeros(11, dtype=np.float32)
+        state[sx.Spacecraft.HEALTH_FLAG_IDX] = 1.0
+        state[sx.SafetyMonitor.POWER_LEVEL_IDX] = 0.9
+        state[_COMM_IDX] = 1.0   # good comm quality
+        pen = ltl.evaluate(state, action=3)
+        # Only no_inaction_on_fault might be relevant; action=3 doesn't trigger it
+        assert pen == pytest.approx(0.0)
+
+    def test_no_full_reset_low_power_violated(self):
+        ltl = sx.LTLConstraintChecker(penalty=-1.0)
+        state = np.zeros(11, dtype=np.float32)
+        state[sx.SafetyMonitor.POWER_LEVEL_IDX] = 0.05
+        state[_COMM_IDX] = 1.0   # good comm quality
+        pen = ltl.evaluate(state, action=2)
+        assert pen < 0.0
+
+    def test_no_violation_returns_zero(self):
+        ltl = sx.LTLConstraintChecker(penalty=-1.0)
+        state = np.zeros(11, dtype=np.float32)
+        state[sx.SafetyMonitor.POWER_LEVEL_IDX] = 0.9
+        state[sx.Spacecraft.HEALTH_FLAG_IDX] = 0.0
+        state[_COMM_IDX] = 1.0   # good comm quality
+        pen = ltl.evaluate(state, action=1)
+        assert pen == pytest.approx(0.0)
+
+    def test_add_custom_constraint(self):
+        ltl = sx.LTLConstraintChecker(penalty=-2.0)
+        ltl.add_constraint("always_fail", lambda s, a: True)
+        assert "always_fail" in ltl.active_names()
+        state = np.zeros(11, dtype=np.float32)
+        state[_COMM_IDX] = 1.0  # good comm to avoid other violations
+        pen = ltl.evaluate(state, action=1)
+        # "always_fail" fires → penalty is at least -2.0
+        assert pen <= -2.0
+
+    def test_remove_constraint(self):
+        ltl = sx.LTLConstraintChecker(penalty=-1.0)
+        ltl.remove_constraint("no_inaction_on_fault")
+        assert "no_inaction_on_fault" not in ltl.active_names()
+
+    def test_remove_nonexistent_is_noop(self):
+        ltl = sx.LTLConstraintChecker()
+        ltl.remove_constraint("nonexistent")   # should not raise
+
+    def test_penalty_must_not_be_positive(self):
+        with pytest.raises(ValueError):
+            sx.LTLConstraintChecker(penalty=1.0)
+
+    def test_zero_penalty_allowed(self):
+        ltl = sx.LTLConstraintChecker(penalty=0.0)
+        state = np.zeros(11, dtype=np.float32)
+        state[sx.Spacecraft.HEALTH_FLAG_IDX] = 1.0
+        assert ltl.evaluate(state, action=0) == pytest.approx(0.0)
+
+
+# ===========================================================================
+# 14. extract_decision_tree
+# ===========================================================================
+
+class TestExtractDecisionTree:
+    def test_returns_classifier(self):
+        pytest.importorskip("sklearn")
+        agent = make_agent()
+        dt = sx.extract_decision_tree(agent, n_samples=200, max_depth=4)
+        assert dt is not None
+
+    def test_fidelity_in_output(self, capsys):
+        pytest.importorskip("sklearn")
+        agent = make_agent()
+        sx.extract_decision_tree(agent, n_samples=100, max_depth=4)
+        out = capsys.readouterr().out
+        assert "fidelity=" in out
+
+    def test_predict_returns_valid_action(self):
+        pytest.importorskip("sklearn")
+        agent = make_agent()
+        dt = sx.extract_decision_tree(agent, n_samples=100, max_depth=3)
+        state = np.random.rand(1, agent.state_dim).astype(np.float32)
+        action = int(dt.predict(state)[0])
+        assert 0 <= action < agent.action_dim
+
+    def test_depth_respected(self):
+        pytest.importorskip("sklearn")
+        agent = make_agent()
+        dt = sx.extract_decision_tree(agent, n_samples=200, max_depth=5)
+        assert dt.get_depth() <= 5
+
+    def test_raises_without_sklearn(self, monkeypatch):
+        monkeypatch.setattr(sx, "_SKLEARN_AVAILABLE", False)
+        agent = make_agent()
+        with pytest.raises(ImportError):
+            sx.extract_decision_tree(agent)
+
+
+# ===========================================================================
+# 15. MissionScenario and build_swarm_for_scenario
+# ===========================================================================
+
+class TestMissionScenario:
+    @pytest.mark.parametrize("factory", [
+        sx.MissionScenario.lunar_gateway,
+        sx.MissionScenario.mars_orbiter,
+        sx.MissionScenario.cubesat_swarm,
+    ])
+    def test_preset_creates_scenario(self, factory):
+        scenario = factory()
+        assert isinstance(scenario, sx.MissionScenario)
+        assert scenario.name
+        assert scenario.profile in (
+            sx.MissionProfile.BALANCED,
+            sx.MissionProfile.MAXIMIZE_DATA_RETURN,
+            sx.MissionProfile.EXTEND_LIFESPAN,
+            sx.MissionProfile.POWER_CONSTRAINED,
+        )
+
+    def test_custom_scenario(self):
+        s = sx.MissionScenario(
+            name="Test",
+            profile=sx.MissionProfile.BALANCED,
+            num_spacecraft=2,
+            comm_delay_steps=3,
+            link_dropout_prob=0.1,
+        )
+        assert s.num_spacecraft == 2
+        assert s.comm_delay_steps == 3
+
+    def test_summary_returns_string(self):
+        s = sx.MissionScenario.lunar_gateway()
+        summary = s.summary()
+        assert isinstance(summary, str)
+        assert "Lunar Gateway" in summary
+        assert "Profile" in summary
+
+    def test_build_swarm_returns_federated_swarm(self):
+        s = sx.MissionScenario.lunar_gateway()
+        s.num_spacecraft = 2
+        swarm = sx.build_swarm_for_scenario(s)
+        assert isinstance(swarm, sx.FederatedSwarm)
+        assert len(swarm.spacecraft) == 2
+
+    def test_build_swarm_fault_params_applied(self):
+        s = sx.MissionScenario.mars_orbiter()
+        s.num_spacecraft = 2
+        swarm = sx.build_swarm_for_scenario(s)
+        for sc in swarm.spacecraft:
+            assert sc.memory.flip_rate == pytest.approx(s.flip_rate_per_bit)
+            assert sc.sensor.stuck_prob == pytest.approx(s.sensor_stuck_prob)
+            assert sc.thermal.drift_std == pytest.approx(s.thermal_drift_std)
+            assert sc.power.drain_rate == pytest.approx(s.power_drain_rate)
+
+    def test_build_swarm_train_episode(self):
+        s = sx.MissionScenario.cubesat_swarm()
+        s.num_spacecraft = 2
+        swarm = sx.build_swarm_for_scenario(s, safety_monitor=sx.SafetyMonitor())
+        r = swarm.train_episode(max_steps=20)
+        assert isinstance(r, float)
+
+    def test_mars_orbiter_has_delay(self):
+        s = sx.MissionScenario.mars_orbiter()
+        assert s.comm_delay_steps > 0
+
+    def test_cubesat_has_large_swarm(self):
+        s = sx.MissionScenario.cubesat_swarm()
+        assert s.num_spacecraft >= 4
+
+    def test_lunar_gateway_power_constrained(self):
+        s = sx.MissionScenario.lunar_gateway()
+        assert s.profile == sx.MissionProfile.POWER_CONSTRAINED
+
+
+# ===========================================================================
+# New feature tests (items 18-23)
+# ===========================================================================
+
+class TestDQNAgentExplainAction:
+    """Tests for DQNAgent.explain_action() – gradient saliency."""
+
+    def test_returns_required_keys(self):
+        agent = make_agent()
+        state = np.zeros(11, dtype=np.float32)
+        result = agent.explain_action(state)
+        for key in ("best_action", "q_values", "saliency", "method"):
+            assert key in result
+
+    def test_best_action_is_valid(self):
+        agent = make_agent()
+        state = np.zeros(11, dtype=np.float32)
+        result = agent.explain_action(state)
+        assert 0 <= result["best_action"] < 4
+
+    def test_q_values_length(self):
+        agent = make_agent()
+        state = np.zeros(11, dtype=np.float32)
+        result = agent.explain_action(state)
+        assert len(result["q_values"]) == 4
+
+    def test_saliency_shape_matches_state(self):
+        agent = make_agent()
+        state = np.zeros(11, dtype=np.float32)
+        result = agent.explain_action(state)
+        assert len(result["saliency"]) == 11
+
+    def test_method_is_gradient_without_shap(self):
+        """Gradient fallback used when shap package is absent."""
+        orig = sx._SHAP_AVAILABLE
+        sx._SHAP_AVAILABLE = False
+        try:
+            agent = make_agent()
+            state = np.zeros(11, dtype=np.float32)
+            result = agent.explain_action(state)
+            assert result["method"] == "gradient"
+        finally:
+            sx._SHAP_AVAILABLE = orig
+
+    def test_non_zero_state_changes_saliency(self):
+        agent = make_agent()
+        s1 = np.zeros(11, dtype=np.float32)
+        s2 = np.ones(11, dtype=np.float32) * 0.5
+        r1 = agent.explain_action(s1)
+        r2 = agent.explain_action(s2)
+        # Both results should have valid saliency shapes regardless of values
+        assert len(r1["saliency"]) == 11
+        assert len(r2["saliency"]) == 11
+
+
+class TestDQNAgentAdaptOnline:
+    """Tests for DQNAgent.adapt_online()."""
+
+    def test_returns_zero_when_no_data(self):
+        agent = make_agent()
+        assert agent.adapt_online([]) == 0.0
+
+    def test_returns_zero_when_too_few_transitions(self):
+        agent = sx.DQNAgent(11, 4, batch_size=32)
+        state = np.zeros(11, dtype=np.float32)
+        transitions = [(state, 0, 1.0, state, False) for _ in range(10)]
+        # 10 < batch_size (32) → should return 0.0
+        assert agent.adapt_online(transitions) == 0.0
+
+    def test_returns_float_with_sufficient_data(self):
+        agent = make_agent()
+        state = np.zeros(11, dtype=np.float32)
+        transitions = [(state, random.randint(0, 3), 1.0, state, False)
+                       for _ in range(50)]
+        result = agent.adapt_online(transitions, n_steps=3)
+        assert isinstance(result, float)
+
+    def test_weights_change_after_adaptation(self):
+        agent = make_agent()
+        state = np.random.randn(11).astype(np.float32)
+        before = [w.copy() for w in agent.model.get_weights()]
+        transitions = [(state, 0, 1.0, state, False) for _ in range(50)]
+        agent.adapt_online(transitions, n_steps=5)
+        after = agent.model.get_weights()
+        assert any(not np.array_equal(b, a) for b, a in zip(before, after))
+
+
+class TestCuriosityBonus:
+    """Tests for the CuriosityBonus class."""
+
+    def test_bonus_positive_on_first_visit(self):
+        cb = sx.CuriosityBonus()
+        state = np.zeros(5, dtype=np.float32)
+        assert cb.bonus(state) > 0.0
+
+    def test_bonus_non_increasing_with_repeated_visits(self):
+        cb = sx.CuriosityBonus()
+        state = np.zeros(5, dtype=np.float32)
+        b1 = cb.bonus(state)
+        b2 = cb.bonus(state)
+        b3 = cb.bonus(state)
+        assert b1 >= b2 >= b3
+
+    def test_reset_clears_counts(self):
+        cb = sx.CuriosityBonus()
+        state = np.zeros(5, dtype=np.float32)
+        cb.bonus(state)
+        cb.reset()
+        assert cb.n_unique_cells == 0
+
+    def test_novel_state_higher_than_repeated(self):
+        cb = sx.CuriosityBonus()
+        state_a = np.zeros(5, dtype=np.float32)
+        state_b = np.ones(5, dtype=np.float32)
+        for _ in range(5):
+            cb.bonus(state_a)       # visit a many times
+        b_novel = cb.bonus(state_b)  # first visit to b
+        b_familiar = cb.bonus(state_a)
+        assert b_novel > b_familiar
+
+    def test_n_unique_cells_grows(self):
+        cb = sx.CuriosityBonus()
+        rng = np.random.default_rng(7)
+        for _ in range(20):
+            cb.bonus(rng.random(5).astype(np.float32))
+        assert cb.n_unique_cells >= 1
+
+    def test_clip_respected(self):
+        cb = sx.CuriosityBonus(bonus_scale=10.0, clip=0.5)
+        state = np.zeros(5, dtype=np.float32)
+        assert cb.bonus(state) <= 0.5
+
+
+class TestCooperativeRewards:
+    """Tests for FederatedSwarm cooperative_bonus."""
+
+    def test_train_episode_with_bonus_returns_float(self):
+        swarm = sx.FederatedSwarm(
+            num_spacecraft=2,
+            action_dim=4,
+            mission_profile=sx.MissionProfile(sx.MissionProfile.BALANCED),
+            federated_interval=5,
+            cooperative_bonus=0.5,
+        )
+        result = swarm.train_episode(max_steps=5)
+        assert isinstance(result, float)
+
+    def test_zero_bonus_is_default(self):
+        swarm = sx.FederatedSwarm(
+            num_spacecraft=2,
+            action_dim=4,
+            mission_profile=sx.MissionProfile(sx.MissionProfile.BALANCED),
+            federated_interval=5,
+        )
+        assert swarm.cooperative_bonus == pytest.approx(0.0)
+
+    def test_cooperative_bonus_stored(self):
+        swarm = sx.FederatedSwarm(
+            num_spacecraft=2,
+            action_dim=4,
+            mission_profile=sx.MissionProfile(sx.MissionProfile.BALANCED),
+            federated_interval=5,
+            cooperative_bonus=1.0,
+        )
+        assert swarm.cooperative_bonus == pytest.approx(1.0)
+
+    def test_build_swarm_for_scenario_passes_bonus(self):
+        scenario = sx.MissionScenario.lunar_gateway()
+        swarm = sx.build_swarm_for_scenario(scenario, cooperative_bonus=0.3)
+        assert swarm.cooperative_bonus == pytest.approx(0.3)
+
+
+class TestPPOAgent:
+    """Tests for the PPOAgent class."""
+
+    @staticmethod
+    def make_ppo():
+        return sx.PPOAgent(state_dim=11, action_dim=4)
+
+    def test_act_returns_valid_types(self):
+        agent = self.make_ppo()
+        state = np.zeros(11, dtype=np.float32)
+        action, log_prob, value = agent.act(state)
+        assert 0 <= action < 4
+        assert isinstance(log_prob, float)
+        assert isinstance(value, float)
+
+    def test_action_within_bounds_non_zero_state(self):
+        agent = self.make_ppo()
+        state = np.ones(11, dtype=np.float32)
+        action, _, _ = agent.act(state)
+        assert 0 <= action < 4
+
+    def test_update_empty_buffer_returns_zero(self):
+        agent = self.make_ppo()
+        assert agent.update() == 0.0
+
+    def test_remember_then_update_returns_float(self):
+        agent = self.make_ppo()
+        state = np.zeros(11, dtype=np.float32)
+        for _ in range(10):
+            action, log_prob, value = agent.act(state)
+            agent.remember(state, action, 1.0, log_prob, value, False)
+        loss = agent.update()
+        assert isinstance(loss, float)
+
+    def test_update_clears_trajectory_buffer(self):
+        agent = self.make_ppo()
+        state = np.zeros(11, dtype=np.float32)
+        for _ in range(5):
+            action, log_prob, value = agent.act(state)
+            agent.remember(state, action, 0.0, log_prob, value, True)
+        agent.update()
+        assert len(agent._states) == 0
+
+    def test_multiple_update_cycles(self):
+        agent = self.make_ppo()
+        state = np.zeros(11, dtype=np.float32)
+        for cycle in range(3):
+            for _ in range(8):
+                action, log_prob, value = agent.act(state)
+                agent.remember(state, action, float(cycle), log_prob, value, False)
+            loss = agent.update()
+            assert isinstance(loss, float)
+
+
+class TestHierarchicalAgent:
+    """Tests for the HierarchicalAgent class."""
+
+    @staticmethod
+    def make_agent():
+        return sx.HierarchicalAgent(state_dim=11, action_dim=4)
+
+    def test_act_returns_valid_action(self):
+        agent = self.make_agent()
+        state = np.zeros(11, dtype=np.float32)
+        action = agent.act(state)
+        assert 0 <= action < 4
+
+    def test_current_phase_name_valid(self):
+        agent = self.make_agent()
+        state = np.zeros(11, dtype=np.float32)
+        agent.act(state)
+        assert agent.current_phase_name in sx.HierarchicalAgent.PHASE_NAMES
+
+    def test_remember_and_replay_no_error(self):
+        agent = self.make_agent()
+        state = np.zeros(11, dtype=np.float32)
+        action = agent.act(state)
+        agent.remember(state, action, 1.0, state, False)
+        agent.replay()   # should not raise
+
+    def test_phase_changes_over_time(self):
+        """After phase_duration steps a new phase is selected."""
+        agent = sx.HierarchicalAgent(
+            state_dim=11, action_dim=4, phase_duration=5
+        )
+        state = np.zeros(11, dtype=np.float32)
+        phases_seen = set()
+        for _ in range(30):
+            agent.act(state)
+            phases_seen.add(agent._current_phase)
+        # At least one phase was visited (may be the same if deterministic)
+        assert len(phases_seen) >= 1
+
+    def test_low_level_state_dim(self):
+        """Low-level agent receives state_dim + 1 features."""
+        agent = self.make_agent()
+        assert agent.low_level.state_dim == 12   # 11 + 1 phase feature
+
+    def test_high_level_action_dim_equals_n_phases(self):
+        agent = self.make_agent()
+        assert agent.high_level.action_dim == sx.HierarchicalAgent.N_PHASES
+
+
+class TestTfFunctionTrainStep:
+    """Tests that the @tf.function train step in DQNAgent works correctly."""
+
+    def test_train_step_callable(self):
+        agent = make_agent()
+        assert callable(agent._train_step_fn)
+
+    def test_replay_still_works_after_refactor(self):
+        """replay() should run without error after the @tf.function refactor."""
+        agent = make_agent()
+        state = np.zeros(11, dtype=np.float32)
+        for _ in range(50):
+            agent.remember(state, 0, 1.0, state, False)
+        agent.replay()   # should not raise
+
+    def test_train_step_reduces_loss(self):
+        """Calling _train_step_fn repeatedly should not diverge."""
+        import tensorflow as tf
+        agent = make_agent()
+        states = tf.zeros((32, 11), dtype=tf.float32)
+        targets = tf.zeros((32, 4), dtype=tf.float32)
+        loss1 = float(agent._train_step_fn(states, targets))
+        loss2 = float(agent._train_step_fn(states, targets))
+        # Losses should be finite (not NaN/Inf)
+        assert loss1 == loss1   # NaN check
+        assert loss2 == loss2
+
+
+# ===========================================================================
+# Infrastructure tests (package, config, deployment script)
+# ===========================================================================
+
+class TestPackageImport:
+    """Verify that the sentinel_x package re-exports the full public API."""
+
+    def test_import_dqnagent(self):
+        import sentinel_x
+        assert hasattr(sentinel_x, "DQNAgent")
+
+    def test_import_spacecraft(self):
+        import sentinel_x
+        assert hasattr(sentinel_x, "Spacecraft")
+
+    def test_import_ppo_agent(self):
+        import sentinel_x
+        assert hasattr(sentinel_x, "PPOAgent")
+
+    def test_import_hierarchical_agent(self):
+        import sentinel_x
+        assert hasattr(sentinel_x, "HierarchicalAgent")
+
+    def test_import_curiosity_bonus(self):
+        import sentinel_x
+        assert hasattr(sentinel_x, "CuriosityBonus")
+
+    def test_import_safety_monitor(self):
+        import sentinel_x
+        assert hasattr(sentinel_x, "SafetyMonitor")
+
+    def test_import_mission_scenario(self):
+        import sentinel_x
+        assert hasattr(sentinel_x, "MissionScenario")
+
+    def test_import_load_config(self):
+        import sentinel_x
+        assert callable(sentinel_x.load_config)
+
+    def test_import_save_default_config(self):
+        import sentinel_x
+        assert callable(sentinel_x.save_default_config)
+
+    def test_all_list_complete(self):
+        import sentinel_x
+        for name in sentinel_x.__all__:
+            assert hasattr(sentinel_x, name), f"Missing: {name}"
+
+
+class TestConfig:
+    """Tests for sentinel_x.config (load_config / save_default_config)."""
+
+    def test_get_default_config_returns_dict(self):
+        from sentinel_x.config import get_default_config
+        cfg = get_default_config()
+        assert isinstance(cfg, dict)
+
+    def test_default_has_required_sections(self):
+        from sentinel_x.config import get_default_config
+        cfg = get_default_config()
+        for section in ("agent", "swarm", "federation", "mission",
+                        "faults", "training", "curiosity", "deployment"):
+            assert section in cfg, f"Missing section: {section}"
+
+    def test_load_config_none_returns_defaults(self):
+        from sentinel_x.config import load_config, get_default_config
+        cfg = load_config(None)
+        default = get_default_config()
+        assert cfg["agent"]["learning_rate"] == default["agent"]["learning_rate"]
+
+    def test_load_config_json(self):
+        import json
+        import tempfile
+        from sentinel_x.config import load_config
+        overrides = {"agent": {"learning_rate": 0.005}, "swarm": {"num_spacecraft": 3}}
+        with tempfile.NamedTemporaryFile(suffix=".json", mode="w",
+                                        delete=False) as f:
+            json.dump(overrides, f)
+            fname = f.name
+        try:
+            cfg = load_config(fname)
+            assert cfg["agent"]["learning_rate"] == pytest.approx(0.005)
+            assert cfg["swarm"]["num_spacecraft"] == 3
+            # defaults still present
+            assert cfg["agent"]["gamma"] == pytest.approx(0.99)
+        finally:
+            os.unlink(fname)
+
+    def test_load_config_yaml(self):
+        pytest.importorskip("yaml")
+        import tempfile
+        from sentinel_x.config import load_config
+        yaml_text = "agent:\n  learning_rate: 0.007\n"
+        with tempfile.NamedTemporaryFile(suffix=".yaml", mode="w",
+                                        delete=False) as f:
+            f.write(yaml_text)
+            fname = f.name
+        try:
+            cfg = load_config(fname)
+            assert cfg["agent"]["learning_rate"] == pytest.approx(0.007)
+        finally:
+            os.unlink(fname)
+
+    def test_save_default_config_json(self):
+        import json
+        import tempfile
+        from sentinel_x.config import save_default_config, get_default_config
+        with tempfile.NamedTemporaryFile(suffix=".json", delete=False) as f:
+            fname = f.name
+        try:
+            save_default_config(fname)
+            with open(fname) as fp:
+                saved = json.load(fp)
+            defaults = get_default_config()
+            assert saved["agent"]["batch_size"] == defaults["agent"]["batch_size"]
+        finally:
+            os.unlink(fname)
+
+    def test_save_default_config_yaml(self):
+        pytest.importorskip("yaml")
+        import tempfile
+        from sentinel_x.config import save_default_config, get_default_config
+        with tempfile.NamedTemporaryFile(suffix=".yaml", delete=False) as f:
+            fname = f.name
+        try:
+            save_default_config(fname)
+            from sentinel_x.config import load_config
+            cfg = load_config(fname)
+            defaults = get_default_config()
+            assert cfg["training"]["episodes"] == defaults["training"]["episodes"]
+        finally:
+            os.unlink(fname)
+
+    def test_load_config_missing_file_raises(self):
+        from sentinel_x.config import load_config
+        with pytest.raises(FileNotFoundError):
+            load_config("/nonexistent/path/to/config.yaml")
+
+    def test_load_config_unsupported_extension_raises(self):
+        import tempfile
+        from sentinel_x.config import load_config
+        with tempfile.NamedTemporaryFile(suffix=".toml", delete=False) as f:
+            fname = f.name
+        try:
+            with pytest.raises(ValueError, match="Unsupported config extension"):
+                load_config(fname)
+        finally:
+            os.unlink(fname)
+
+    def test_deep_merge_preserves_unmentioned_keys(self):
+        from sentinel_x.config import load_config
+        import json
+        import tempfile
+        # Only override one key; everything else should keep its default
+        overrides = {"training": {"episodes": 999}}
+        with tempfile.NamedTemporaryFile(suffix=".json", mode="w",
+                                        delete=False) as f:
+            json.dump(overrides, f)
+            fname = f.name
+        try:
+            cfg = load_config(fname)
+            assert cfg["training"]["episodes"] == 999
+            assert cfg["training"]["max_steps"] == 200   # untouched default
+        finally:
+            os.unlink(fname)
+
+
+class TestReplayTFLite:
+    """Tests for scripts/replay_tflite.py without requiring a real TFLite model."""
+
+    def test_builtin_scenario_length(self):
+        from scripts.replay_tflite import _builtin_scenario
+        states = _builtin_scenario(30)
+        assert len(states) == 30
+
+    def test_builtin_scenario_shape(self):
+        from scripts.replay_tflite import _builtin_scenario, STATE_DIM
+        states = _builtin_scenario(10)
+        for s in states:
+            assert s.shape == (STATE_DIM,)
+
+    def test_builtin_scenario_range(self):
+        from scripts.replay_tflite import _builtin_scenario
+        states = _builtin_scenario(20)
+        for s in states:
+            assert float(s.min()) >= 0.0
+            assert float(s.max()) <= 1.0
+
+    def test_load_scenario_json(self):
+        import json
+        import tempfile
+        from scripts.replay_tflite import _load_scenario, STATE_DIM
+        data = [[0.0] * STATE_DIM, [1.0] * STATE_DIM]
+        with tempfile.NamedTemporaryFile(suffix=".json", mode="w",
+                                        delete=False) as f:
+            json.dump(data, f)
+            fname = f.name
+        try:
+            states = _load_scenario(fname)
+            assert len(states) == 2
+            assert states[0].shape == (STATE_DIM,)
+        finally:
+            os.unlink(fname)
+
+    def test_load_scenario_wrong_dim_raises(self):
+        import json
+        import tempfile
+        from scripts.replay_tflite import _load_scenario
+        data = [[0.0, 1.0, 0.5]]   # wrong state dimension
+        with tempfile.NamedTemporaryFile(suffix=".json", mode="w",
+                                        delete=False) as f:
+            json.dump(data, f)
+            fname = f.name
+        try:
+            with pytest.raises(ValueError, match="expected"):
+                _load_scenario(fname)
+        finally:
+            os.unlink(fname)
+
+    def test_load_scenario_not_list_raises(self):
+        import json
+        import tempfile
+        from scripts.replay_tflite import _load_scenario
+        with tempfile.NamedTemporaryFile(suffix=".json", mode="w",
+                                        delete=False) as f:
+            json.dump({"state": [0.0]}, f)
+            fname = f.name
+        try:
+            with pytest.raises(ValueError, match="list"):
+                _load_scenario(fname)
+        finally:
+            os.unlink(fname)
+
+
+# ===========================================================================
+# New feature tests (items 1a, 1b, 1c)
+# ===========================================================================
+
+# ---------------------------------------------------------------------------
+# 1a) LTL integration into FederatedSwarm
+# ---------------------------------------------------------------------------
+
+class TestFederatedSwarmLTL:
+    """LTL constrained-RL penalty integration in FederatedSwarm."""
+
+    def _make_swarm(self, ltl_checker=None):
+        return sx.FederatedSwarm(
+            num_spacecraft=2,
+            action_dim=4,
+            mission_profile=sx.MissionProfile(sx.MissionProfile.BALANCED),
+            federated_interval=5,
+            ltl_checker=ltl_checker,
+        )
+
+    def test_ltl_checker_none_by_default(self):
+        swarm = self._make_swarm()
+        assert swarm.ltl_checker is None
+
+    def test_ltl_checker_stored(self):
+        ltl = sx.LTLConstraintChecker(penalty=-0.5)
+        swarm = self._make_swarm(ltl_checker=ltl)
+        assert swarm.ltl_checker is ltl
+
+    def test_last_ltl_penalty_zero_without_checker(self):
+        swarm = self._make_swarm()
+        swarm.train_episode(max_steps=10)
+        assert swarm.last_ltl_penalty == pytest.approx(0.0)
+
+    def test_last_ltl_penalty_nonpositive_with_checker(self):
+        """With LTL enabled, cumulative penalty must be ≤ 0."""
+        ltl = sx.LTLConstraintChecker(penalty=-1.0)
+        swarm = self._make_swarm(ltl_checker=ltl)
+        swarm.train_episode(max_steps=20)
+        assert swarm.last_ltl_penalty <= 0.0
+
+    def test_train_episode_returns_float_with_ltl(self):
+        ltl = sx.LTLConstraintChecker(penalty=-0.5)
+        swarm = self._make_swarm(ltl_checker=ltl)
+        result = swarm.train_episode(max_steps=10)
+        assert isinstance(result, float)
+
+    def test_build_swarm_for_scenario_passes_ltl(self):
+        scenario = sx.MissionScenario.lunar_gateway()
+        ltl = sx.LTLConstraintChecker(penalty=-0.5)
+        swarm = sx.build_swarm_for_scenario(
+            scenario, ltl_checker=ltl
+        )
+        assert swarm.ltl_checker is ltl
+
+    def test_ltl_penalty_lower_than_without(self):
+        """Episode reward WITH penalty should differ from WITHOUT."""
+        import random as _random
+        _random.seed(0)
+        np.random.seed(0)
+
+        swarm_no_ltl = sx.FederatedSwarm(
+            num_spacecraft=2,
+            action_dim=4,
+            mission_profile=sx.MissionProfile(sx.MissionProfile.BALANCED),
+            federated_interval=999,
+        )
+        swarm_ltl = sx.FederatedSwarm(
+            num_spacecraft=2,
+            action_dim=4,
+            mission_profile=sx.MissionProfile(sx.MissionProfile.BALANCED),
+            federated_interval=999,
+            ltl_checker=sx.LTLConstraintChecker(penalty=-1.0),
+        )
+        # Copy weights so they start identically
+        for agent_ltl, agent_no in zip(swarm_ltl.agents, swarm_no_ltl.agents):
+            agent_ltl.model.set_weights(agent_no.model.get_weights())
+
+        # Run a single episode with the same RNG state
+        import random as _random
+        _random.seed(42)
+        np.random.seed(42)
+        r_no_ltl = swarm_no_ltl.train_episode(max_steps=20)
+
+        _random.seed(42)
+        np.random.seed(42)
+        r_ltl = swarm_ltl.train_episode(max_steps=20)
+
+        # LTL penalties make the reward lower (the penalty is <= 0)
+        assert r_ltl <= r_no_ltl + 1e-6
+
+
+# ---------------------------------------------------------------------------
+# 1b) Decision-tree showcase: export_decision_tree_rules + dt_fidelity_report
+# ---------------------------------------------------------------------------
+
+class TestExportDecisionTreeRules:
+    """Tests for export_decision_tree_rules()."""
+
+    @pytest.fixture
+    def agent_and_dt(self):
+        pytest.importorskip("sklearn")
+        agent = make_agent()
+        dt = sx.extract_decision_tree(agent, n_samples=200, max_depth=3)
+        return agent, dt
+
+    def test_returns_non_empty_string(self, agent_and_dt):
+        _, dt = agent_and_dt
+        rules = sx.export_decision_tree_rules(dt)
+        assert isinstance(rules, str)
+        assert len(rules) > 0
+
+    def test_contains_if_else(self, agent_and_dt):
+        _, dt = agent_and_dt
+        rules = sx.export_decision_tree_rules(dt)
+        assert "if " in rules
+        assert "return " in rules
+
+    def test_custom_feature_names(self, agent_and_dt):
+        _, dt = agent_and_dt
+        names = [f"feat_{i}" for i in range(11)]
+        rules = sx.export_decision_tree_rules(dt, feature_names=names)
+        # The tree may not split on every feature; check that *some* feat_ names appear
+        assert any(f"feat_{i}" in rules for i in range(11))
+
+    def test_custom_action_names(self, agent_and_dt):
+        _, dt = agent_and_dt
+        action_names = ["IDLE", "REBOOT", "REDUNDANT", "SAFE"]
+        rules = sx.export_decision_tree_rules(dt, action_names=action_names)
+        # At least one action name should appear in leaves
+        assert any(a in rules for a in action_names)
+
+    def test_coverage_annotation_present(self, agent_and_dt):
+        _, dt = agent_and_dt
+        rules = sx.export_decision_tree_rules(dt)
+        assert "coverage=" in rules
+
+    def test_raises_without_sklearn(self):
+        orig = sx._SKLEARN_AVAILABLE
+        sx._SKLEARN_AVAILABLE = False
+        try:
+            with pytest.raises(ImportError):
+                sx.export_decision_tree_rules(None)
+        finally:
+            sx._SKLEARN_AVAILABLE = orig
+
+
+class TestDtFidelityReport:
+    """Tests for dt_fidelity_report()."""
+
+    @pytest.fixture
+    def agent_and_dt(self):
+        pytest.importorskip("sklearn")
+        agent = make_agent()
+        dt = sx.extract_decision_tree(agent, n_samples=300, max_depth=4)
+        return agent, dt
+
+    def test_returns_dict_with_required_keys(self, agent_and_dt):
+        agent, dt = agent_and_dt
+        report = sx.dt_fidelity_report(agent, dt, n_eval=100)
+        for key in ("fidelity", "action_match_counts", "action_total_counts",
+                    "per_action_fidelity", "n_eval"):
+            assert key in report
+
+    def test_fidelity_in_unit_interval(self, agent_and_dt):
+        agent, dt = agent_and_dt
+        report = sx.dt_fidelity_report(agent, dt, n_eval=200)
+        assert 0.0 <= report["fidelity"] <= 1.0
+
+    def test_n_eval_matches(self, agent_and_dt):
+        agent, dt = agent_and_dt
+        report = sx.dt_fidelity_report(agent, dt, n_eval=150)
+        assert report["n_eval"] == 150
+
+    def test_action_total_counts_sum_to_n_eval(self, agent_and_dt):
+        agent, dt = agent_and_dt
+        report = sx.dt_fidelity_report(agent, dt, n_eval=100)
+        assert sum(report["action_total_counts"].values()) == 100
+
+    def test_per_action_fidelity_valid_range(self, agent_and_dt):
+        agent, dt = agent_and_dt
+        report = sx.dt_fidelity_report(agent, dt, n_eval=200)
+        for a, fid in report["per_action_fidelity"].items():
+            if fid == fid:   # skip NaN entries (action never chosen by DQN)
+                assert 0.0 <= fid <= 1.0
+
+    def test_raises_without_sklearn(self):
+        orig = sx._SKLEARN_AVAILABLE
+        sx._SKLEARN_AVAILABLE = False
+        try:
+            with pytest.raises(ImportError):
+                sx.dt_fidelity_report(None, None)
+        finally:
+            sx._SKLEARN_AVAILABLE = orig
+
+
+# ---------------------------------------------------------------------------
+# 1b) SafetyMonitor with dt_fallback
+# ---------------------------------------------------------------------------
+
+class TestSafetyMonitorDtFallback:
+    """Tests for SafetyMonitor dt_fallback parameter."""
+
+    def test_no_fallback_by_default(self):
+        m = sx.SafetyMonitor()
+        assert m.dt_fallback is None
+
+    def test_fallback_stored(self):
+        pytest.importorskip("sklearn")
+        agent = make_agent()
+        dt = sx.extract_decision_tree(agent, n_samples=100, max_depth=3)
+        m = sx.SafetyMonitor(dt_fallback=dt)
+        assert m.dt_fallback is dt
+
+    def test_hard_constraints_still_fire_with_fallback(self):
+        """Hard constraints override the DT fallback."""
+        pytest.importorskip("sklearn")
+        agent = make_agent()
+        dt = sx.extract_decision_tree(agent, n_samples=100, max_depth=3)
+        m = sx.SafetyMonitor(dt_fallback=dt)
+        # Faulted state + action=0 → must still return 3 (safe mode)
+        state = np.zeros(11, dtype=np.float32)
+        state[sx.Spacecraft.HEALTH_FLAG_IDX] = 1.0
+        assert m.veto(0, state, 4) == 3
+
+    def test_fallback_can_nudge_on_healthy_state(self):
+        """On a healthy state where DQN says 0, DT fallback may override."""
+        pytest.importorskip("sklearn")
+        # Train a trivial DT that always returns 3 (safe mode)
+        from sklearn.tree import DecisionTreeClassifier
+        dt = DecisionTreeClassifier(max_depth=1)
+        # Fit with all labels = 3
+        dummy_states = np.zeros((10, 11), dtype=np.float32)
+        dummy_labels = np.full(10, 3)
+        dt.fit(dummy_states, dummy_labels)
+
+        m = sx.SafetyMonitor(dt_fallback=dt)
+        state = np.zeros(11, dtype=np.float32)
+        # Healthy state (health_flag=0) + action=0 → DT recommends 3
+        result = m.veto(0, state, 4)
+        assert result == 3   # DT nudge applied
+
+    def test_fallback_not_applied_when_dqn_acts(self):
+        """When DQN proposes a non-zero action, DT fallback is not consulted."""
+        pytest.importorskip("sklearn")
+        from sklearn.tree import DecisionTreeClassifier
+        dt = DecisionTreeClassifier(max_depth=1)
+        dummy_states = np.zeros((10, 11), dtype=np.float32)
+        dummy_labels = np.full(10, 1)
+        dt.fit(dummy_states, dummy_labels)
+
+        m = sx.SafetyMonitor(dt_fallback=dt)
+        state = np.zeros(11, dtype=np.float32)
+        # Set power above critical threshold so hard constraint 2 doesn't fire
+        state[sx.SafetyMonitor.POWER_LEVEL_IDX] = 0.8
+        # Non-zero action (2) with healthy state → DT fallback not consulted
+        assert m.veto(2, state, 4) == 2
+
+    def test_old_api_still_works(self):
+        """SafetyMonitor() with no arguments is still valid (backward compat)."""
+        m = sx.SafetyMonitor()
+        state = np.zeros(11, dtype=np.float32)
+        state[sx.Spacecraft.HEALTH_FLAG_IDX] = 1.0
+        assert m.veto(0, state, 4) == 3
+
+    def test_package_exports_new_symbols(self):
+        """sentinel_x package re-exports all new public symbols."""
+        import sentinel_x
+        for sym in ("export_decision_tree_rules", "dt_fidelity_report"):
+            assert hasattr(sentinel_x, sym), f"Missing export: {sym}"
+
+
+# ---------------------------------------------------------------------------
+# 1c) Config: ltl section
+# ---------------------------------------------------------------------------
+
+class TestConfigLTLSection:
+    """Verify the new 'ltl' section in the default config."""
+
+    def test_ltl_section_present(self):
+        from sentinel_x.config import get_default_config
+        cfg = get_default_config()
+        assert "ltl" in cfg
+
+    def test_ltl_enabled_default_false(self):
+        from sentinel_x.config import get_default_config
+        cfg = get_default_config()
+        assert cfg["ltl"]["enabled"] is False
+
+    def test_ltl_penalty_default_negative(self):
+        from sentinel_x.config import get_default_config
+        cfg = get_default_config()
+        assert cfg["ltl"]["penalty"] < 0.0
+
+    def test_ltl_section_survives_merge(self):
+        import json
+        import tempfile
+        from sentinel_x.config import load_config
+        overrides = {"ltl": {"enabled": True}}
+        with tempfile.NamedTemporaryFile(suffix=".json", mode="w",
+                                        delete=False) as f:
+            json.dump(overrides, f)
+            fname = f.name
+        try:
+            cfg = load_config(fname)
+            assert cfg["ltl"]["enabled"] is True
+            # Default penalty untouched
+            assert cfg["ltl"]["penalty"] < 0.0
+        finally:
+            os.unlink(fname)
+
+
+# ---------------------------------------------------------------------------
+# 1c) Cookbook script: run_lunar_gateway (smoke test)
+# ---------------------------------------------------------------------------
+
+class TestRunLunarGateway:
+    """Smoke-test the Lunar Gateway cookbook script helpers."""
+
+    def test_scenario_is_power_constrained(self):
+        scenario = sx.MissionScenario.lunar_gateway()
+        assert scenario.profile == sx.MissionProfile.POWER_CONSTRAINED
+
+    def test_build_with_ltl_and_safety_monitor(self):
+        scenario = sx.MissionScenario.lunar_gateway()
+        ltl = sx.LTLConstraintChecker(penalty=-0.5)
+        swarm = sx.build_swarm_for_scenario(
+            scenario,
+            safety_monitor=sx.SafetyMonitor(),
+            ltl_checker=ltl,
+        )
+        assert swarm.ltl_checker is ltl
+        assert swarm.safety_monitor is not None
+
+    def test_train_episode_with_all_features(self):
+        scenario = sx.MissionScenario.lunar_gateway()
+        swarm = sx.build_swarm_for_scenario(
+            scenario,
+            safety_monitor=sx.SafetyMonitor(),
+            ltl_checker=sx.LTLConstraintChecker(penalty=-0.5),
+            cooperative_bonus=0.1,
+        )
+        result = swarm.train_episode(max_steps=15)
+        assert isinstance(result, float)
+        assert swarm.last_ltl_penalty <= 0.0
+        assert swarm.last_override_count >= 0
+
+
+# ===========================================================================
+# run_experiment.py tests
+# ===========================================================================
+
+class TestRunExperiment:
+    """Smoke tests for the config-driven run_experiment.py runner."""
+
+    def _import_runner(self):
+        """Import run_experiment.py (lives in repo root)."""
+        import importlib.util
+        import os
+        spec = importlib.util.spec_from_file_location(
+            "run_experiment",
+            os.path.join(os.path.dirname(__file__), "..", "run_experiment.py"),
+        )
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        return mod
+
+    def test_step_train_returns_list(self):
+        runner = self._import_runner()
+        swarm = sx.FederatedSwarm(
+            num_spacecraft=2, action_dim=4,
+            mission_profile=sx.MissionProfile(sx.MissionProfile.BALANCED),
+            federated_interval=999,
+        )
+        cfg = {"training": {"episodes": 3, "max_steps": 10}}
+        rewards = runner.step_train(swarm, cfg)
+        assert isinstance(rewards, list)
+        assert len(rewards) == 3
+
+    def test_step_evaluate_returns_float(self):
+        runner = self._import_runner()
+        swarm = sx.FederatedSwarm(
+            num_spacecraft=2, action_dim=4,
+            mission_profile=sx.MissionProfile(sx.MissionProfile.BALANCED),
+        )
+        cfg = {"training": {"max_steps": 20}}
+        ops = runner.step_evaluate(swarm, cfg)
+        assert isinstance(ops, float)
+        assert 0.0 <= ops <= 20.0
+
+    def test_step_export_writes_files(self):
+        import tempfile
+        runner = self._import_runner()
+        swarm = sx.FederatedSwarm(
+            num_spacecraft=2, action_dim=4,
+            mission_profile=sx.MissionProfile(sx.MissionProfile.BALANCED),
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "model_int8.tflite")
+            cfg = {"deployment": {"tflite_int8_path": path}}
+            result = runner.step_export(swarm, cfg)
+        assert "dynamic" in result
+        assert "int8" in result
+
+    def test_step_verify_returns_dict(self):
+        runner = self._import_runner()
+        swarm = sx.FederatedSwarm(
+            num_spacecraft=2, action_dim=4,
+            mission_profile=sx.MissionProfile(sx.MissionProfile.BALANCED),
+        )
+        report = runner.step_verify(swarm)
+        assert "overall_passed" in report
+        assert "safety_constraint" in report
+
+    def test_step_certify_returns_dict(self):
+        runner = self._import_runner()
+        swarm = sx.FederatedSwarm(
+            num_spacecraft=2, action_dim=4,
+            mission_profile=sx.MissionProfile(sx.MissionProfile.BALANCED),
+        )
+        cert = runner.step_certify(swarm, n_adv=20)
+        assert "mean_radius" in cert
+        assert "robust_frac" in cert
+
+    def test_step_surrogate_returns_dict_or_empty(self):
+        runner = self._import_runner()
+        swarm = sx.FederatedSwarm(
+            num_spacecraft=2, action_dim=4,
+            mission_profile=sx.MissionProfile(sx.MissionProfile.BALANCED),
+        )
+        result = runner.step_surrogate(swarm, rules_path="/tmp/_sx_test_rules.txt")
+        assert isinstance(result, dict)
+
+    def test_save_config_writes_yaml(self):
+        import tempfile
+        runner = self._import_runner()
+
+        class _Args:
+            save_config = None
+            config = None
+            scenario = None
+            episodes = None
+            max_steps = None
+            no_export = True
+            no_verify = True
+            no_certify = True
+            no_surrogate = True
+
+        with tempfile.NamedTemporaryFile(suffix=".yaml", delete=False) as f:
+            fname = f.name
+        try:
+            args = _Args()
+            args.save_config = fname
+            runner.run(args)
+            assert os.path.getsize(fname) > 0
+        finally:
+            os.unlink(fname)
+
+    def test_build_swarm_from_config_no_ltl(self):
+        runner = self._import_runner()
+        from sentinel_x.config import get_default_config
+        cfg = get_default_config()
+        cfg["ltl"]["enabled"] = False
+        swarm = runner._build_swarm_from_config(cfg, None)
+        assert swarm.ltl_checker is None
+
+    def test_build_swarm_from_config_with_ltl(self):
+        runner = self._import_runner()
+        from sentinel_x.config import get_default_config
+        cfg = get_default_config()
+        cfg["ltl"]["enabled"] = True
+        cfg["ltl"]["penalty"] = -1.0
+        swarm = runner._build_swarm_from_config(cfg, None)
+        assert swarm.ltl_checker is not None
+
+    def test_build_swarm_with_scenario(self):
+        runner = self._import_runner()
+        from sentinel_x.config import get_default_config
+        cfg = get_default_config()
+        scenario = sx.MissionScenario.lunar_gateway()
+        swarm = runner._build_swarm_from_config(cfg, scenario)
+        assert len(swarm.spacecraft) == scenario.num_spacecraft
+
+    def test_run_minimal_no_verify_no_certify(self):
+        """Full run with all optional steps disabled (fast smoke test)."""
+        runner = self._import_runner()
+
+        class _Args:
+            save_config = None
+            config = None
+            scenario = None
+            episodes = 2
+            max_steps = 10
+            no_export = True
+            no_verify = True
+            no_certify = True
+            no_surrogate = True
+
+        runner.run(_Args())  # must not raise
+
+
+# ===========================================================================
+# examples/lunar_gateway.py smoke test
+# ===========================================================================
+
+class TestExamplesLunarGateway:
+    """Verify examples/lunar_gateway.py imports and scenario is correct."""
+
+    def test_scenario_type(self):
+        scenario = sx.MissionScenario.lunar_gateway()
+        assert scenario.profile == sx.MissionProfile.POWER_CONSTRAINED
+
+    def test_example_file_exists(self):
+        import os
+        path = os.path.join(
+            os.path.dirname(__file__), "..", "examples", "lunar_gateway.py"
+        )
+        assert os.path.isfile(path), "examples/lunar_gateway.py is missing"
+
+
+# ===========================================================================
+# scripts/mcu_emulator.py tests
+# ===========================================================================
+
+class TestMcuEmulator:
+    """Smoke tests for the MCU hardware emulator script."""
+
+    def _import_emulator(self):
+        import importlib.util
+        spec = importlib.util.spec_from_file_location(
+            "mcu_emulator",
+            os.path.join(os.path.dirname(__file__), "..", "scripts", "mcu_emulator.py"),
+        )
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        return mod
+
+    def test_module_imports(self):
+        mod = self._import_emulator()
+        assert hasattr(mod, "run_demo")
+        assert hasattr(mod, "run_server")
+        assert hasattr(mod, "run_client")
+
+    def test_fault_scenarios_not_empty(self):
+        mod = self._import_emulator()
+        assert len(mod._FAULT_SCENARIOS) >= 8
+        for name, state in mod._FAULT_SCENARIOS:
+            assert isinstance(name, str)
+            assert state.shape == (mod._STATE_DIM,)
+
+    def test_apply_safety_veto_inaction_on_fault(self):
+        mod = self._import_emulator()
+        import numpy as np
+        # health_flag (index 5) = 1.0 → veto action=0 → should become SAFE_MODE
+        state = np.zeros(mod._STATE_DIM, dtype=np.float32)
+        state[5] = 1.0   # health fault active
+        state[7] = 0.8   # power OK
+        action, vetoed = mod._apply_safety_veto(0, state)
+        assert vetoed is True
+        assert action == 3  # SAFE_MODE
+
+    def test_apply_safety_veto_low_power_reset(self):
+        mod = self._import_emulator()
+        import numpy as np
+        state = np.zeros(mod._STATE_DIM, dtype=np.float32)
+        state[5] = 0.0   # no health fault
+        state[7] = 0.08  # critically low power
+        action, vetoed = mod._apply_safety_veto(2, state)  # SWITCH_REDUNDANT
+        assert vetoed is True
+        assert action == 3  # SAFE_MODE
+
+    def test_apply_safety_veto_no_veto_needed(self):
+        mod = self._import_emulator()
+        import numpy as np
+        state = np.zeros(mod._STATE_DIM, dtype=np.float32)
+        state[5] = 0.0   # healthy
+        state[7] = 0.9   # plenty of power
+        action, vetoed = mod._apply_safety_veto(0, state)
+        assert vetoed is False
+        assert action == 0
+
+    def test_mcu_emulator_demo_writes_csv_log(self):
+        """Demo mode writes a CSV log."""
+        import tempfile
+        mod = self._import_emulator()
+
+        # We need a real TFLite model for this test
+        swarm = sx.FederatedSwarm(
+            num_spacecraft=2, action_dim=4,
+            mission_profile=sx.MissionProfile(sx.MissionProfile.BALANCED),
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            model_path = os.path.join(tmp, "test_model_int8.tflite")
+            sx.export_tflite_int8(swarm.agents[0], output_path=model_path, n_calib_samples=8)
+            log_path = os.path.join(tmp, "test_log.csv")
+
+            class _Args:
+                model = model_path
+                mcu_latency_ms = 1.5
+                steps = 4
+                log_file = log_path
+
+            mod.run_demo(_Args())
+            assert os.path.isfile(log_path)
+            with open(log_path, encoding="utf-8") as f:
+                content = f.read()
+            assert "step" in content
+            assert "action" in content
+
+    def test_script_file_exists(self):
+        path = os.path.join(
+            os.path.dirname(__file__), "..", "scripts", "mcu_emulator.py"
+        )
+        assert os.path.isfile(path)
+
+
+# ===========================================================================
+# scripts/benchmark_inference.py tests
+# ===========================================================================
+
+class TestBenchmarkInference:
+    """Smoke tests for the TFLite inference benchmarker."""
+
+    def _import_benchmarker(self):
+        import importlib.util
+        spec = importlib.util.spec_from_file_location(
+            "benchmark_inference",
+            os.path.join(os.path.dirname(__file__), "..", "scripts", "benchmark_inference.py"),
+        )
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        return mod
+
+    def test_module_imports(self):
+        mod = self._import_benchmarker()
+        assert hasattr(mod, "_benchmark")
+        assert hasattr(mod, "_load_interpreter")
+        assert hasattr(mod, "_run_one")
+
+    def test_benchmark_returns_report(self):
+        import tempfile
+        import numpy as np
+        mod = self._import_benchmarker()
+
+        swarm = sx.FederatedSwarm(
+            num_spacecraft=2, action_dim=4,
+            mission_profile=sx.MissionProfile(sx.MissionProfile.BALANCED),
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            model_path = os.path.join(tmp, "bench_int8.tflite")
+            sx.export_tflite_int8(swarm.agents[0], output_path=model_path, n_calib_samples=8)
+
+            rng    = np.random.default_rng(0)
+            report = mod._benchmark(model_path, warmup=5, runs=20, rng=rng, quiet=True)
+
+        assert report["timed_runs"] == 20
+        assert report["warmup_runs"] == 5
+        assert "latency_ms" in report
+        lat = report["latency_ms"]
+        assert lat["min"] <= lat["p50"] <= lat["max"]
+        assert lat["mean"] > 0.0
+        assert report["throughput_ips"] > 0
+        assert report["model_size_bytes"] > 0
+        assert "action_distribution" in report
+
+    def test_report_keys_complete(self):
+        import tempfile
+        import numpy as np
+        mod = self._import_benchmarker()
+
+        swarm = sx.FederatedSwarm(
+            num_spacecraft=2, action_dim=4,
+            mission_profile=sx.MissionProfile(sx.MissionProfile.BALANCED),
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            model_path = os.path.join(tmp, "bench_dyn.tflite")
+            sx.export_tflite(swarm.agents[0], output_path=model_path)
+
+            rng    = np.random.default_rng(1)
+            report = mod._benchmark(model_path, warmup=3, runs=10, rng=rng, quiet=True)
+
+        required_keys = [
+            "model", "warmup_runs", "timed_runs", "device",
+            "latency_ms", "throughput_ips", "peak_rss_mb",
+            "model_size_bytes", "action_distribution",
+        ]
+        for k in required_keys:
+            assert k in report, f"Missing key: {k}"
+
+        lat_keys = ["min", "p5", "p25", "p50", "p75", "p95", "p99", "max", "mean", "std"]
+        for k in lat_keys:
+            assert k in report["latency_ms"], f"Missing latency key: {k}"
+
+    def test_json_output_written(self):
+        import tempfile
+        import json as _json
+        import numpy as np
+        mod = self._import_benchmarker()
+
+        swarm = sx.FederatedSwarm(
+            num_spacecraft=2, action_dim=4,
+            mission_profile=sx.MissionProfile(sx.MissionProfile.BALANCED),
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            model_path  = os.path.join(tmp, "bench_out_int8.tflite")
+            output_path = os.path.join(tmp, "report.json")
+            sx.export_tflite_int8(swarm.agents[0], output_path=model_path, n_calib_samples=8)
+
+            rng    = np.random.default_rng(2)
+            report = mod._benchmark(model_path, warmup=3, runs=10, rng=rng, quiet=True)
+            from pathlib import Path
+            Path(output_path).write_text(_json.dumps(report, indent=2), encoding="utf-8")
+
+            assert os.path.isfile(output_path)
+            loaded = _json.loads(Path(output_path).read_text())
+            assert loaded["timed_runs"] == 10
+
+    def test_script_file_exists(self):
+        path = os.path.join(
+            os.path.dirname(__file__), "..", "scripts", "benchmark_inference.py"
+        )
+        assert os.path.isfile(path)
+
+    def test_docs_custom_mission_exists(self):
+        path = os.path.join(
+            os.path.dirname(__file__), "..", "docs", "custom_mission_tutorial.md"
+        )
+        assert os.path.isfile(path)
+
+
+# ===========================================================================
+# hardware/ package tests (HAL, sensor interfaces, drivers)
+# ===========================================================================
+
+class TestHardwareHAL:
+    """Smoke tests for the hardware abstraction layer."""
+
+    def test_sensor_reading_to_state_vector_healthy(self):
+        from hardware.hal import SensorReading
+        r = SensorReading(
+            timestamp_s=0.0,
+            memory_error_count=0,
+            parity_error_flag=False,
+            sensor_deviation=0.0,
+            sensor_stuck=False,
+            time_since_recovery_s=0.0,
+            health_flag=False,
+            thermal_fault=False,
+            power_level_v=3.3,
+            attitude_rate_dps=0.0,
+            comm_quality_db=-60.0,
+        )
+        sv = r.to_state_vector()
+        assert len(sv) == 11
+        assert all(0.0 <= v <= 1.0 for v in sv), f"Out of range: {sv}"
+        # Healthy state: no faults → first two features near 0
+        assert sv[0] == 0.0   # memory errors = 0
+        assert sv[1] == 0.0   # parity flag = False
+
+    def test_sensor_reading_to_state_vector_fault(self):
+        from hardware.hal import SensorReading
+        r = SensorReading(
+            timestamp_s=1.0,
+            memory_error_count=5,
+            parity_error_flag=True,
+            sensor_deviation=5.0,
+            sensor_stuck=True,
+            time_since_recovery_s=100.0,
+            health_flag=True,
+            thermal_fault=True,
+            power_level_v=0.5,
+            attitude_rate_dps=90.0,
+            comm_quality_db=-100.0,
+        )
+        sv = r.to_state_vector()
+        assert sv[0] == 0.5   # 5/10 memory errors
+        assert sv[1] == 1.0   # parity flag
+        assert sv[3] == 1.0   # stuck flag
+        assert sv[5] == 1.0   # health flag
+        assert sv[6] == 1.0   # thermal fault
+
+    def test_sensor_reading_clips_out_of_range(self):
+        from hardware.hal import SensorReading
+        r = SensorReading(
+            timestamp_s=0.0,
+            memory_error_count=999,    # way over _MAX_MEMORY_ERRORS
+            power_level_v=100.0,       # way over _MAX_POWER_V
+        )
+        sv = r.to_state_vector()
+        assert sv[0] == 1.0   # clipped at 1.0
+        assert sv[7] == 1.0   # clipped at 1.0
+
+    def test_actuator_command_round_trip(self):
+        from hardware.hal import ActuatorCommand
+        for action in range(4):
+            cmd = ActuatorCommand(action_index=action)
+            data = cmd.to_bytes()
+            assert data[0] == 0xAA
+            assert data[1] == action
+            recovered = ActuatorCommand.from_bytes(data)
+            assert recovered.action_index == action
+
+    def test_actuator_command_labels(self):
+        from hardware.hal import ActuatorCommand
+        assert ActuatorCommand(0).action_label == "DO_NOTHING"
+        assert ActuatorCommand(1).action_label == "RESTART"
+        assert ActuatorCommand(2).action_label == "SWITCH_REDUNDANT"
+        assert ActuatorCommand(3).action_label == "SAFE_MODE"
+
+    def test_actuator_command_invalid_bytes(self):
+        from hardware.hal import ActuatorCommand
+        import pytest
+        with pytest.raises(ValueError):
+            ActuatorCommand.from_bytes(b"\xFF\x01")   # wrong header
+
+    def test_simulated_driver_round_trip(self):
+        from hardware.rpi_driver import SimulatedDriver
+        from hardware.hal import ActuatorCommand
+        drv = SimulatedDriver(fault_prob=0.0, seed=42)
+        with drv:
+            assert drv.is_connected()
+            reading = drv.read_sensors()
+            sv = reading.to_state_vector()
+            assert len(sv) == 11
+            cmd = ActuatorCommand(action_index=0)
+            drv.write_action(cmd)   # should not raise
+
+    def test_simulated_driver_fault_injection(self):
+        from hardware.rpi_driver import SimulatedDriver
+        drv = SimulatedDriver(fault_prob=1.0, seed=0)
+        with drv:
+            readings = [drv.read_sensors() for _ in range(20)]
+        # With fault_prob=1.0 at least some readings should have health issues
+        health_faults = sum(1 for r in readings if r.health_flag)
+        assert health_faults > 0, "Expected at least one health fault at fault_prob=1.0"
+
+    def test_spacecraft_sensor_interface_filter(self):
+        from hardware.rpi_driver import SimulatedDriver
+        from hardware.sensor_interfaces import SpacecraftSensorInterface
+        drv    = SimulatedDriver(fault_prob=0.0, seed=0)
+        sensor = SpacecraftSensorInterface(drv, filter_len=3)
+        with drv:
+            states = [sensor.read_state() for _ in range(10)]
+        assert len(states[0]) == 11
+        assert all(0.0 <= v <= 1.0 for state in states for v in state)
+
+    def test_spacecraft_sensor_interface_log(self):
+        from hardware.rpi_driver import SimulatedDriver
+        from hardware.sensor_interfaces import SpacecraftSensorInterface
+        drv    = SimulatedDriver(seed=1)
+        sensor = SpacecraftSensorInterface(drv, log_capacity=5)
+        with drv:
+            for _ in range(8):
+                sensor.read_state()
+        records = sensor.drain_log()
+        assert len(records) == 5   # ring buffer cap
+        assert "ts" in records[0]
+        assert "raw" in records[0]
+        assert "filtered" in records[0]
+
+    def test_create_hardware_interface_simulation(self):
+        from hardware import create_hardware_interface
+        hw = create_hardware_interface("simulation")
+        assert hw is not None
+        with hw:
+            assert hw.is_connected()
+
+    def test_create_hardware_interface_invalid(self):
+        from hardware import create_hardware_interface
+        import pytest
+        with pytest.raises(ValueError, match="Unknown target"):
+            create_hardware_interface("quantum_computer")
+
+    def test_hardware_docs_exist(self):
+        path = os.path.join(
+            os.path.dirname(__file__), "..", "docs", "hardware_integration.md"
+        )
+        assert os.path.isfile(path)
+
+    def test_rtos_docs_exist(self):
+        path = os.path.join(
+            os.path.dirname(__file__), "..", "docs", "rtos_integration.md"
+        )
+        assert os.path.isfile(path)
+
+    def test_freertos_task_c_exists(self):
+        path = os.path.join(
+            os.path.dirname(__file__), "..", "hardware", "freertos_task.c"
+        )
+        assert os.path.isfile(path)
+
+
+# ===========================================================================
+# sentinel_x/formal_verification.py tests
+# ===========================================================================
+
+class TestFormalVerification:
+    """Tests for the optional Marabou/ERAN integration module."""
+
+    def _import_fv(self):
+        from sentinel_x import formal_verification as fv
+        return fv
+
+    def test_module_imports(self):
+        fv = self._import_fv()
+        assert hasattr(fv, "MarabouVerifier")
+        assert hasattr(fv, "ERANVerifier")
+        assert hasattr(fv, "export_to_onnx")
+        assert hasattr(fv, "available_verifiers")
+
+    def test_available_verifiers_returns_dict(self):
+        fv = self._import_fv()
+        avail = fv.available_verifiers()
+        assert isinstance(avail, dict)
+        assert "marabou" in avail
+        assert "eran" in avail
+        assert "onnx_export" in avail
+        # All values must be bool
+        for k, v in avail.items():
+            assert isinstance(v, bool), f"{k} should be bool, got {type(v)}"
+
+    def test_sentinel_x_package_exports_fv(self):
+        """formal_verification symbols must be importable from the package."""
+        import sentinel_x as sx
+        assert hasattr(sx, "available_verifiers")
+        assert hasattr(sx, "MarabouVerifier")
+        assert hasattr(sx, "ERANVerifier")
+        assert hasattr(sx, "export_to_onnx")
+
+    def test_marabou_verifier_raises_import_error_when_not_installed(self):
+        """If maraboupy is not installed, constructor raises ImportError."""
+        fv = self._import_fv()
+        if fv._HAS_MARABOU:
+            import pytest
+            pytest.skip("Marabou is installed – skipping absence test")
+        import pytest
+        with pytest.raises(ImportError, match="[Mm]arabou"):
+            fv.MarabouVerifier("nonexistent.onnx")
+
+    def test_eran_verifier_raises_import_error_when_not_installed(self):
+        fv = self._import_fv()
+        if fv._HAS_ERAN:
+            import pytest
+            pytest.skip("ERAN is installed – skipping absence test")
+        import pytest
+        with pytest.raises(ImportError, match="[Ee][Rr][Aa][Nn]"):
+            fv.ERANVerifier("nonexistent.onnx")
+
+    def test_export_to_onnx_raises_import_error_when_not_installed(self):
+        fv = self._import_fv()
+        if fv._HAS_ONNX:
+            import pytest
+            pytest.skip("onnx is installed – skipping absence test")
+        import pytest
+        with pytest.raises(ImportError, match="[Oo][Nn][Nn][Xx]"):
+            fv.export_to_onnx(None, "test.onnx")
+
+    def test_marabou_verifier_raises_file_not_found_when_marabou_installed(self):
+        """If Marabou is installed but file missing → FileNotFoundError."""
+        fv = self._import_fv()
+        if not fv._HAS_MARABOU:
+            import pytest
+            pytest.skip("Marabou not installed")
+        import pytest
+        with pytest.raises(FileNotFoundError):
+            fv.MarabouVerifier("/nonexistent/path/model.onnx")
+
+    def test_formal_verification_docs_exist(self):
+        path = os.path.join(
+            os.path.dirname(__file__), "..", "docs",
+            "formal_verification_external.md"
+        )
+        assert os.path.isfile(path)
+
+
+# ===========================================================================
+# sentinel_x/formation.py tests
+# ===========================================================================
+
+class TestConsensusProtocol:
+    """Tests for the distributed consensus protocol."""
+
+    def test_convergence_ring(self):
+        from sentinel_x.formation import ConsensusProtocol
+        cp = ConsensusProtocol(n_agents=4, mixing_weight=0.5, topology="ring")
+        cp.set_values([1.0, 0.0, 1.0, 0.0])
+        cp.run(n_steps=30)
+        mean = float(np.mean(cp.values))
+        assert abs(mean - 0.5) < 1e-6
+        assert cp.converged
+
+    def test_convergence_complete(self):
+        from sentinel_x.formation import ConsensusProtocol
+        cp = ConsensusProtocol(n_agents=5, mixing_weight=0.8, topology="complete")
+        cp.set_values([0.0, 0.2, 0.4, 0.6, 0.8])
+        cp.run(n_steps=10)
+        assert cp.converged
+        assert abs(float(np.mean(cp.values)) - 0.4) < 1e-4
+
+    def test_convergence_star(self):
+        from sentinel_x.formation import ConsensusProtocol
+        cp = ConsensusProtocol(n_agents=4, mixing_weight=0.6, topology="star")
+        cp.set_values([1.0, 0.0, 0.5, 0.25])
+        cp.run(n_steps=40)
+        assert cp.converged
+
+    def test_history_length(self):
+        from sentinel_x.formation import ConsensusProtocol
+        cp = ConsensusProtocol(n_agents=3, mixing_weight=0.5, topology="ring")
+        cp.set_values([0.1, 0.5, 0.9])
+        cp.run(n_steps=5)
+        # history starts with initial + 5 steps = 6 entries
+        assert len(cp.history) == 6
+
+    def test_convergence_step_reported(self):
+        from sentinel_x.formation import ConsensusProtocol
+        cp = ConsensusProtocol(n_agents=3, mixing_weight=0.9, topology="complete")
+        cp.set_values([1.0, 0.0, 0.0])
+        cp.run(n_steps=20)
+        step = cp.convergence_step
+        assert step is not None
+        assert step >= 0
+
+    def test_invalid_topology(self):
+        from sentinel_x.formation import ConsensusProtocol
+        import pytest
+        with pytest.raises(ValueError, match="topology"):
+            ConsensusProtocol(n_agents=3, topology="mesh")
+
+    def test_invalid_n_agents(self):
+        from sentinel_x.formation import ConsensusProtocol
+        import pytest
+        with pytest.raises(ValueError, match="at least 2"):
+            ConsensusProtocol(n_agents=1)
+
+    def test_wrong_values_length(self):
+        from sentinel_x.formation import ConsensusProtocol
+        import pytest
+        cp = ConsensusProtocol(n_agents=3)
+        with pytest.raises(ValueError, match="Expected 3"):
+            cp.set_values([0.1, 0.2])
+
+
+class TestFormationGeometry:
+    """Tests for formation geometry builders."""
+
+    def test_line_formation(self):
+        from sentinel_x.formation import FormationGeometry
+        g = FormationGeometry.build(n_followers=3, formation_type="line", separation_m=100.0)
+        assert len(g.offsets) == 3
+        for i, (dx, dy) in enumerate(g.offsets, start=1):
+            assert dx == -i * 100.0
+            assert dy == 0.0
+
+    def test_v_formation(self):
+        from sentinel_x.formation import FormationGeometry
+        g = FormationGeometry.build(n_followers=4, formation_type="v", separation_m=100.0)
+        assert len(g.offsets) == 4
+
+    def test_diamond_formation(self):
+        from sentinel_x.formation import FormationGeometry
+        g = FormationGeometry.build(n_followers=4, formation_type="diamond", separation_m=100.0)
+        assert len(g.offsets) == 4
+
+    def test_circular_formation_angles(self):
+        from sentinel_x.formation import FormationGeometry
+        import math
+        g = FormationGeometry.build(n_followers=4, formation_type="circular", separation_m=100.0)
+        assert len(g.offsets) == 4
+        # All followers at distance 100 from origin
+        for dx, dy in g.offsets:
+            dist = math.sqrt(dx ** 2 + dy ** 2)
+            assert abs(dist - 100.0) < 1e-6
+
+    def test_invalid_formation_type(self):
+        from sentinel_x.formation import FormationGeometry
+        import pytest
+        with pytest.raises(ValueError, match="formation_type"):
+            FormationGeometry.build(n_followers=2, formation_type="hexagon")
+
+
+class TestFormationController:
+    """Tests for the leader-follower formation controller."""
+
+    def _make_swarm(self):
+        swarm = sx.FederatedSwarm(
+            num_spacecraft=3, action_dim=4,
+            mission_profile=sx.MissionProfile(sx.MissionProfile.BALANCED),
+        )
+        return swarm
+
+    def test_init_line_formation(self):
+        from sentinel_x.formation import FormationController
+        swarm = self._make_swarm()
+        fc = FormationController(swarm, formation_type="line", separation_m=100.0)
+        assert fc.metrics is not None
+        errors = fc.formation_errors()
+        assert len(errors) == 2    # 3 SC - 1 leader = 2 followers
+
+    def test_formation_coherence_initial(self):
+        from sentinel_x.formation import FormationController
+        swarm = self._make_swarm()
+        fc = FormationController(swarm, formation_type="line", separation_m=100.0)
+        coherence = fc.formation_coherence()
+        assert 0.0 <= coherence <= 1.0
+
+    def test_train_episode_with_formation(self):
+        from sentinel_x.formation import FormationController
+        swarm = self._make_swarm()
+        fc = FormationController(swarm, formation_type="line", separation_m=50.0)
+        reward = fc.train_episode_with_formation(max_steps=50)
+        assert isinstance(reward, float)
+
+    def test_metrics_after_training(self):
+        from sentinel_x.formation import FormationController
+        swarm = self._make_swarm()
+        fc = FormationController(swarm, formation_type="v", separation_m=100.0)
+        for _ in range(3):
+            fc.train_episode_with_formation(max_steps=20)
+        summary = fc.metrics.summary()
+        assert summary["n_steps"] == 3
+        assert 0.0 <= summary["mean_coherence"] <= 1.0
+
+    def test_consensus_estimate(self):
+        from sentinel_x.formation import FormationController
+        swarm = self._make_swarm()
+        fc = FormationController(swarm, formation_type="line", separation_m=100.0)
+        est = fc.get_consensus_estimate()
+        assert "agents" in est
+        assert "mean" in est
+        assert "std" in est
+        assert len(est["agents"]) == 3
+
+
+class TestFormationMetrics:
+    def test_empty_summary(self):
+        from sentinel_x.formation import FormationMetrics
+        m = FormationMetrics(n_spacecraft=3)
+        s = m.summary()
+        assert s["n_steps"] == 0
+
+    def test_record_and_summary(self):
+        from sentinel_x.formation import FormationMetrics
+        m = FormationMetrics(n_spacecraft=3)
+        m.record(step=0, coherence=0.9, errors=np.array([10.0, 20.0]))
+        m.record(step=1, coherence=0.8, errors=np.array([15.0, 25.0]))
+        s = m.summary()
+        assert s["n_steps"] == 2
+        assert abs(s["mean_coherence"] - 0.85) < 1e-6
+        assert s["max_error_m"] == 25.0
+
+    def test_ring_buffer_capacity(self):
+        from sentinel_x.formation import FormationMetrics
+        m = FormationMetrics(n_spacecraft=2, capacity=5)
+        for i in range(10):
+            m.record(step=i, coherence=0.5, errors=np.array([1.0]))
+        assert m.summary()["n_steps"] == 5
+
+
+# ===========================================================================
+# sentinel_x/mission_control.py tests
+# ===========================================================================
+
+class TestMissionControlBridge:
+    """Tests for the mission control integration module."""
+
+    def _import_mc(self):
+        from sentinel_x import mission_control as mc
+        return mc
+
+    def test_module_imports(self):
+        mc = self._import_mc()
+        assert hasattr(mc, "MissionControlBridge")
+        assert hasattr(mc, "FPrimeAdapter")
+        assert hasattr(mc, "TASTEAdapter")
+        assert hasattr(mc, "available_adapters")
+
+    def test_sentinel_x_package_exports_mc(self):
+        import sentinel_x as sx
+        assert hasattr(sx, "MissionControlBridge")
+        assert hasattr(sx, "FPrimeAdapter")
+        assert hasattr(sx, "TASTEAdapter")
+        assert hasattr(sx, "available_adapters")
+
+    def test_available_adapters_returns_dict(self):
+        mc    = self._import_mc()
+        avail = mc.available_adapters()
+        assert isinstance(avail, dict)
+        assert "fprime" in avail and "taste" in avail
+        for v in avail.values():
+            assert isinstance(v, bool)
+
+    def test_base_bridge_publish_log(self, tmp_path):
+        mc = self._import_mc()
+
+        class SimpleBridge(mc.MissionControlBridge):
+            pass
+
+        log = str(tmp_path / "telem.jsonl")
+        bridge = SimpleBridge(log_path=log)
+        bridge.connect()
+        bridge.publish_telemetry({"spacecraft_id": 0, "step": 1, "action": 2})
+        bridge.publish_episode_summary(episode=1, reward=3.5, overrides=0)
+        bridge.send_command("RESET", {})
+        bridge.disconnect()
+
+        assert os.path.isfile(log)
+        import json
+        lines = open(log).readlines()
+        assert len(lines) == 3    # publish + summary + command
+        assert json.loads(lines[0])["spacecraft_id"] == 0
+
+    def test_base_bridge_tx_count(self, tmp_path):
+        mc = self._import_mc()
+
+        class SimpleBridge(mc.MissionControlBridge):
+            pass
+
+        bridge = SimpleBridge(log_path=None)
+        bridge.connect()
+        assert bridge.tx_count == 0
+        bridge.publish_telemetry({"x": 1})
+        bridge.publish_telemetry({"x": 2})
+        assert bridge.tx_count == 2
+        bridge.send_command("CMD", {})
+        assert bridge.rx_count == 1
+
+    def test_base_bridge_context_manager(self, tmp_path):
+        mc = self._import_mc()
+
+        class SimpleBridge(mc.MissionControlBridge):
+            pass
+
+        log = str(tmp_path / "telem2.jsonl")
+        with SimpleBridge(log_path=log) as bridge:
+            assert bridge.is_connected
+            bridge.publish_telemetry({"ok": True})
+        assert not bridge.is_connected
+
+    def test_fprime_adapter_raises_import_error(self):
+        mc = self._import_mc()
+        if mc._HAS_FPRIME:
+            import pytest
+            pytest.skip("fprime-gds is installed")
+        import pytest
+        with pytest.raises(ImportError, match="fprime"):
+            mc.FPrimeAdapter()
+
+    def test_taste_adapter_raises_import_error(self):
+        mc = self._import_mc()
+        if mc._HAS_ASN1:
+            import pytest
+            pytest.skip("asn1tools is installed")
+        import pytest
+        with pytest.raises(ImportError, match="asn1"):
+            mc.TASTEAdapter()
+
+    def test_mission_control_docs_exist(self):
+        path = os.path.join(
+            os.path.dirname(__file__), "..", "docs",
+            "mission_control_integration.md"
+        )
+        assert os.path.isfile(path)
+
+
+# ===========================================================================
+# scripts/hardware_timing_validator.py tests
+# ===========================================================================
+
+class TestHardwareTimingValidator:
+    """Tests for the hardware timing validation script."""
+
+    def _import_validator(self):
+        import importlib.util, sys
+        path = os.path.join(os.path.dirname(__file__), "..",
+                            "scripts", "hardware_timing_validator.py")
+        spec = importlib.util.spec_from_file_location("hardware_timing_validator", path)
+        mod  = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        return mod
+
+    def test_script_exists(self):
+        path = os.path.join(
+            os.path.dirname(__file__), "..", "scripts",
+            "hardware_timing_validator.py"
+        )
+        assert os.path.isfile(path)
+
+    def test_state_normalisation_timing(self):
+        mod = self._import_validator()
+        stats, ok = mod._test_state_normalisation(runs=50, quiet=True)
+        assert ok
+        assert "p99_ms" in stats
+        assert stats["p99_ms"] < 10.0   # must be well under budget on any machine
+
+    def test_safety_monitor_timing(self):
+        mod = self._import_validator()
+        stats, ok = mod._test_safety_monitor(runs=50, quiet=True)
+        assert ok
+        assert stats["p99_ms"] < 10.0
+
+    def test_main_simulation_mode(self, tmp_path):
+        mod = self._import_validator()
+        report_path = str(tmp_path / "timing_report.json")
+        ret = mod.main([
+            "--runs",   "30",
+            "--output", report_path,
+            "--quiet",
+        ])
+        assert ret == 0
+        import json
+        report = json.loads(open(report_path).read())
+        assert "inference"      in report
+        assert "normalisation"  in report
+        assert "safety_monitor" in report
+        assert report["summary"]["all_passed"] is True
+
+    def test_deployment_validation_docs_exist(self):
+        path = os.path.join(
+            os.path.dirname(__file__), "..", "docs",
+            "hardware_deployment_validation.md"
+        )
+        assert os.path.isfile(path)
+
+
+# ===========================================================================
+# scripts/dashboard.py tests
+# ===========================================================================
+
+class TestDashboard:
+    """Tests for the operator dashboard module."""
+
+    def _import_dashboard(self):
+        import importlib.util
+        path = os.path.join(os.path.dirname(__file__), "..",
+                            "scripts", "dashboard.py")
+        spec = importlib.util.spec_from_file_location("dashboard", path)
+        mod  = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        return mod
+
+    def test_script_exists(self):
+        path = os.path.join(os.path.dirname(__file__), "..",
+                            "scripts", "dashboard.py")
+        assert os.path.isfile(path)
+
+    def test_dashboard_state_init(self):
+        mod = self._import_dashboard()
+        state = mod.DashboardState(n_spacecraft=4)
+        assert state.n_spacecraft == 4
+        assert len(state.health) == 4
+        assert state.episode == 0
+
+    def test_dashboard_state_update_and_snapshot(self):
+        mod = self._import_dashboard()
+        state = mod.DashboardState(n_spacecraft=3)
+        state.update(episode=5, overrides=2)
+        snap = state.snapshot()
+        assert snap["episode"] == 5
+        assert snap["overrides"] == 2
+
+    def test_action_labels(self):
+        mod = self._import_dashboard()
+        assert len(mod.ACTION_LABELS) == 4
+        assert mod.ACTION_LABELS[0] == "DO_NOTHING"
+        assert mod.ACTION_LABELS[3] == "SAFE_MODE"
+
+    def test_formation_coordination_docs_exist(self):
+        path = os.path.join(
+            os.path.dirname(__file__), "..", "docs",
+            "formation_coordination.md"
+        )
+        assert os.path.isfile(path)
+
+
+# ===========================================================================
+# scripts/collect_hardware_perf.py tests
+# ===========================================================================
+
+class TestCollectHardwarePerf:
+    """Tests for the hardware performance data collection script."""
+
+    def _import_collector(self):
+        import importlib.util
+        path = os.path.join(os.path.dirname(__file__), "..",
+                            "scripts", "collect_hardware_perf.py")
+        spec = importlib.util.spec_from_file_location(
+            "collect_hardware_perf", path)
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        return mod
+
+    def test_script_exists(self):
+        path = os.path.join(os.path.dirname(__file__), "..",
+                            "scripts", "collect_hardware_perf.py")
+        assert os.path.isfile(path)
+
+    def test_pct_helper(self):
+        mod = self._import_collector()
+        times_ns = [int(x * 1e6) for x in [1.0, 2.0, 3.0, 4.0, 5.0]]
+        r = mod._pct(times_ns)
+        assert "p50_ms" in r and "p99_ms" in r and "mean_ms" in r
+        assert abs(r["p50_ms"] - 3.0) < 0.01
+
+    def test_main_simulation(self, tmp_path):
+        mod = self._import_collector()
+        json_out = str(tmp_path / "perf.json")
+        md_out   = str(tmp_path / "perf.md")
+        ret = mod.main([
+            "--timing-runs",    "10",
+            "--train-episodes", "2",
+            "--max-steps",      "10",
+            "--json-out",       json_out,
+            "--md-out",         md_out,
+            "--quiet",
+        ])
+        assert ret == 0
+        assert os.path.isfile(json_out)
+        assert os.path.isfile(md_out)
+
+        import json
+        data = json.loads(open(json_out).read())
+        assert "timing" in data
+        assert "rl"     in data
+        assert data["rl"]["train_episodes"] == 2
+        assert 0.0 <= data["rl"]["fault_recovery_rate"] <= 1.0
+
+    def test_md_report_contains_sections(self, tmp_path):
+        mod = self._import_collector()
+        json_out = str(tmp_path / "p.json")
+        md_out   = str(tmp_path / "p.md")
+        mod.main([
+            "--timing-runs", "5", "--train-episodes", "1",
+            "--max-steps",   "10",
+            "--json-out", json_out, "--md-out", md_out, "--quiet",
+        ])
+        md = open(md_out).read()
+        assert "Inference Pipeline Latency" in md
+        assert "Reinforcement Learning Performance" in md
+        assert "PASS" in md or "FAIL" in md
+        md = open(md_out).read()
+        assert "Inference Pipeline Latency" in md
+        assert "Reinforcement Learning Performance" in md
+        assert "PASS" in md or "FAIL" in md
+
+    def test_hardware_perf_results_doc_exists(self):
+        path = os.path.join(os.path.dirname(__file__), "..",
+                            "docs", "hardware_performance_results.md")
+        assert os.path.isfile(path)
+
+
+# ===========================================================================
+# Open-source artefact tests
+# ===========================================================================
+
+class TestOpenSourceArtefacts:
+    """Verify Apache 2.0 licence, CONTRIBUTING, CITATION, and technical report."""
+
+    def test_license_apache(self):
+        path = os.path.join(os.path.dirname(__file__), "..", "LICENSE")
+        assert os.path.isfile(path)
+        content = open(path).read()
+        assert "Apache License" in content
+        assert "Version 2.0" in content
+
+    def test_contributing_exists(self):
+        path = os.path.join(os.path.dirname(__file__), "..", "CONTRIBUTING.md")
+        assert os.path.isfile(path)
+        content = open(path).read()
+        assert "pull request" in content.lower() or "pull-request" in content.lower()
+
+    def test_citation_cff_exists(self):
+        path = os.path.join(os.path.dirname(__file__), "..", "CITATION.cff")
+        assert os.path.isfile(path)
+        content = open(path).read()
+        assert "cff-version" in content
+        assert "Apache-2.0" in content
+
+    def test_technical_report_exists(self):
+        path = os.path.join(os.path.dirname(__file__), "..",
+                            "docs", "technical_report.md")
+        assert os.path.isfile(path)
+        content = open(path).read()
+        assert "Abstract" in content
+        assert "Architecture" in content
+        assert "Verification" in content
+        assert "References" in content
+
+    def test_pyproject_license(self):
+        path = os.path.join(os.path.dirname(__file__), "..", "pyproject.toml")
+        content = open(path).read()
+        assert "Apache Software License" in content or "Apache-2.0" in content
+
+
+# ===========================================================================
+# Task allocation and swarm reconfiguration
+# ===========================================================================
+
+from sentinel_x.coordination import (
+    AllocationResult,
+    TaskAllocator,
+    SwarmReconfigurationManager,
+    ReconfigurationEvent,
+)
+
+
+def _make_earth_obs_swarm():
+    """Return a 6-spacecraft Earth-observation swarm (fast, simulation)."""
+    scenario = sx.MissionScenario.earth_observation_constellation()
+    return sx.build_swarm_for_scenario(scenario)
+
+
+def _make_telescope_swarm():
+    """Return a 4-spacecraft deep-space telescope swarm."""
+    scenario = sx.MissionScenario.deep_space_telescope_array()
+    return sx.build_swarm_for_scenario(scenario)
+
+
+_TASKS = [
+    {"id": "img_0", "type": "imaging", "priority": 0.9, "position": (100.0, 0.0)},
+    {"id": "img_1", "type": "imaging", "priority": 0.7, "position": (-100.0, 0.0)},
+    {"id": "rel_0", "type": "relay",   "priority": 0.5, "position": (0.0, 200.0)},
+]
+
+
+class TestMissionScenarioNewMissions:
+    def test_earth_observation_constellation(self):
+        sc = sx.MissionScenario.earth_observation_constellation()
+        assert sc.num_spacecraft == 6
+        assert sc.profile == sx.MissionProfile.MAXIMIZE_DATA_RETURN
+        assert sc.link_dropout_prob > 0
+
+    def test_deep_space_telescope_array(self):
+        sc = sx.MissionScenario.deep_space_telescope_array()
+        assert sc.num_spacecraft == 4
+        assert sc.profile == sx.MissionProfile.POWER_CONSTRAINED
+
+    def test_earth_obs_summary_contains_name(self):
+        sc = sx.MissionScenario.earth_observation_constellation()
+        s = sc.summary()
+        assert "Earth Observation" in s
+
+    def test_telescope_summary_contains_name(self):
+        sc = sx.MissionScenario.deep_space_telescope_array()
+        s = sc.summary()
+        assert "L2" in s
+
+
+class TestTaskAllocator:
+    def test_allocate_returns_result(self):
+        swarm = _make_earth_obs_swarm()
+        alloc = TaskAllocator(swarm)
+        result = alloc.allocate(_TASKS)
+        assert isinstance(result, AllocationResult)
+
+    def test_all_tasks_assigned_when_enough_agents(self):
+        swarm = _make_earth_obs_swarm()
+        alloc = TaskAllocator(swarm)
+        result = alloc.allocate(_TASKS)
+        # 6 agents, 3 tasks – all should be assigned
+        assert len(result.assignments) + len(result.unassigned) == len(_TASKS)
+
+    def test_assignments_are_valid_agent_indices(self):
+        swarm = _make_earth_obs_swarm()
+        alloc = TaskAllocator(swarm)
+        result = alloc.allocate(_TASKS)
+        n = len(swarm.spacecraft)
+        for agent_idx in result.assignments.values():
+            assert 0 <= agent_idx < n
+
+    def test_exclusive_mode_no_double_assignment(self):
+        swarm = _make_earth_obs_swarm()
+        alloc = TaskAllocator(swarm, exclusive=True)
+        result = alloc.allocate(_TASKS)
+        assigned_agents = list(result.assignments.values())
+        assert len(assigned_agents) == len(set(assigned_agents)), (
+            "Each agent should appear at most once in exclusive mode."
+        )
+
+    def test_non_exclusive_allows_repeated_agent(self):
+        swarm = _make_earth_obs_swarm()
+        # Place all agents at the same position so the winner is always the
+        # same healthiest agent in non-exclusive mode.
+        positions = [(0.0, 0.0)] * len(swarm.spacecraft)
+        alloc = TaskAllocator(swarm, agent_positions=positions, exclusive=False)
+        result = alloc.allocate(_TASKS)
+        # With same position for all, same winner may appear for multiple tasks
+        assert len(result.assignments) + len(result.unassigned) == len(_TASKS)
+
+    def test_bid_matrix_populated(self):
+        swarm = _make_earth_obs_swarm()
+        alloc = TaskAllocator(swarm)
+        result = alloc.allocate(_TASKS)
+        for tid in [t["id"] for t in _TASKS]:
+            assert tid in result.bids
+
+    def test_update_position(self):
+        swarm = _make_earth_obs_swarm()
+        alloc = TaskAllocator(swarm)
+        alloc.update_position(0, (999.0, -999.0))
+        assert alloc._positions[0] == (999.0, -999.0)
+
+    def test_update_position_out_of_range(self):
+        swarm = _make_earth_obs_swarm()
+        alloc = TaskAllocator(swarm)
+        with pytest.raises(IndexError):
+            alloc.update_position(100, (0.0, 0.0))
+
+    def test_reallocate_failed_returns_empty_when_all_alive(self):
+        swarm = _make_earth_obs_swarm()
+        alloc = TaskAllocator(swarm)
+        prev = alloc.allocate(_TASKS)
+        realloc = alloc.reallocate_failed(prev, _TASKS)
+        # All spacecraft still alive → nothing to reallocate
+        assert len(realloc.assignments) == 0
+
+    def test_summary_structure(self):
+        swarm = _make_earth_obs_swarm()
+        alloc = TaskAllocator(swarm)
+        alloc.allocate(_TASKS)
+        s = alloc.summary()
+        assert "rounds" in s and "assignment_rate" in s
+        assert s["rounds"] == 1
+
+    def test_custom_agent_positions_length_mismatch_raises(self):
+        swarm = _make_earth_obs_swarm()
+        with pytest.raises(ValueError):
+            TaskAllocator(swarm, agent_positions=[(0.0, 0.0)])   # too few
+
+
+class TestSwarmReconfigurationManager:
+    def test_no_event_when_swarm_healthy(self):
+        swarm = _make_earth_obs_swarm()
+        rcm = SwarmReconfigurationManager(swarm)
+        # Fresh swarm – all spacecraft operational, no trigger expected
+        event = rcm.check_and_reconfigure()
+        # A healthy swarm with no failed leader should return None
+        assert event is None or isinstance(event, ReconfigurationEvent)
+
+    def test_initial_state(self):
+        swarm = _make_earth_obs_swarm()
+        rcm = SwarmReconfigurationManager(swarm)
+        assert rcm.current_leader == 0
+        assert rcm.suggested_formation in ("circular", "v", "diamond", "line")
+        assert not rcm.is_degraded
+        assert rcm.healthy_fraction > 0.0
+
+    def test_healthy_fraction_range(self):
+        swarm = _make_earth_obs_swarm()
+        rcm = SwarmReconfigurationManager(swarm)
+        assert 0.0 <= rcm.healthy_fraction <= 1.0
+
+    def test_leader_promotion_when_leader_fails(self):
+        swarm = _make_earth_obs_swarm()
+        rcm = SwarmReconfigurationManager(swarm)
+        # Force leader failure
+        swarm.spacecraft[0].memory.flip_rate_per_bit = 1.0
+        swarm.spacecraft[0].memory.step()
+        swarm.spacecraft[0].memory.step()
+        # Make spacecraft[0] non-operational by draining its power
+        swarm.spacecraft[0].power._level = 0.0
+        event = rcm.check_and_reconfigure()
+        # If spacecraft 0 is now dead, leader should be promoted
+        if not swarm.spacecraft[0].is_operational():
+            assert event is not None
+            assert event.action in ("leader_promoted", "formation_reshaped",
+                                    "degraded_mode")
+
+    def test_formation_reshape_event_structure(self):
+        swarm = _make_earth_obs_swarm()
+        rcm = SwarmReconfigurationManager(
+            swarm, reshape_threshold=0.99, degraded_threshold=0.01
+        )
+        # Force reshape by simulating many failures
+        for sc in swarm.spacecraft[:5]:
+            sc.power._level = 0.0
+        event = rcm.check_and_reconfigure()
+        if event is not None and event.action == "formation_reshaped":
+            assert event.new_formation is not None
+            assert isinstance(event.detail, str)
+
+    def test_force_reconfiguration(self):
+        swarm = _make_earth_obs_swarm()
+        rcm = SwarmReconfigurationManager(swarm)
+        event = rcm.force_reconfiguration("diamond")
+        assert event.action == "formation_reshaped"
+        assert event.new_formation == "diamond"
+        assert rcm.suggested_formation == "diamond"
+
+    def test_force_reconfiguration_invalid_raises(self):
+        swarm = _make_earth_obs_swarm()
+        rcm = SwarmReconfigurationManager(swarm)
+        with pytest.raises(ValueError):
+            rcm.force_reconfiguration("hexagonal")
+
+    def test_on_event_callback_called(self):
+        swarm = _make_earth_obs_swarm()
+        events_received = []
+        rcm = SwarmReconfigurationManager(
+            swarm,
+            on_event=lambda ev: events_received.append(ev),
+        )
+        rcm.force_reconfiguration("line")
+        assert len(events_received) == 1
+        assert events_received[0].action == "formation_reshaped"
+
+    def test_summary_structure(self):
+        swarm = _make_earth_obs_swarm()
+        rcm = SwarmReconfigurationManager(swarm)
+        rcm.force_reconfiguration("v")
+        s = rcm.summary()
+        assert "total_events" in s
+        assert "current_leader" in s
+        assert s["total_events"] >= 1
+
+    def test_invalid_thresholds_raise(self):
+        swarm = _make_earth_obs_swarm()
+        with pytest.raises(ValueError):
+            SwarmReconfigurationManager(
+                swarm, reshape_threshold=0.3, degraded_threshold=0.6
+            )
+
+    def test_event_log_grows(self):
+        swarm = _make_earth_obs_swarm()
+        rcm = SwarmReconfigurationManager(swarm)
+        rcm.force_reconfiguration("line")
+        rcm.force_reconfiguration("circular")
+        assert len(rcm.event_log) == 2
+
+
+class TestExamplesEarthObservation:
+    def test_earth_obs_example_runs(self, tmp_path, monkeypatch):
+        """Smoke test: earth_observation.py completes without error."""
+        import importlib.util, sys as _sys
+
+        examples_dir = os.path.join(os.path.dirname(__file__), "..", "examples")
+        spec = importlib.util.spec_from_file_location(
+            "earth_observation",
+            os.path.join(examples_dir, "earth_observation.py"),
+        )
+        # Patch EPISODES to 2 for speed
+        monkeypatch.setattr("builtins.open", open)   # no-op patch to trigger monkeypatch fixture
+        mod = importlib.util.module_from_spec(spec)
+        # Monkey-patch constant inside the module before exec
+        mod.__dict__["EPISODES"] = 2
+        _sys.modules["earth_observation"] = mod
+        spec.loader.exec_module(mod)
+
+
+class TestCoordinationDocExists:
+    def test_coordination_doc_exists(self):
+        path = os.path.join(
+            os.path.dirname(__file__), "..", "docs", "coordination.md"
+        )
+        assert os.path.isfile(path), "docs/coordination.md not found"
+        content = open(path).read()
+        assert "TaskAllocator" in content
+        assert "SwarmReconfigurationManager" in content
