@@ -3,6 +3,11 @@
 This guide explains how to wire real spacecraft hardware to the SENTINEL-X
 software pipeline and run the trained RL policy on an actual embedded device.
 
+> **Quick-start for first-time users:**
+> For a step-by-step deployment walkthrough covering hardware preparation,
+> installation, UART testing, and the full validation pipeline see
+> **[`docs/hardware_deployment.md`](hardware_deployment.md)**.
+
 The `hardware/` package provides a three-layer abstraction:
 
 ```
@@ -57,6 +62,19 @@ python -c "import serial.tools.list_ports; print(list(serial.tools.list_ports.co
 # Linux: usually /dev/ttyUSB0 or /dev/ttyACM0
 # macOS: /dev/cu.usbserial-*
 # Windows: COM3, COM4, …
+```
+
+Verify connectivity with the built-in ping command:
+
+```bash
+# Ping the MCU and print one parsed SensorReading
+python -m sentinel_x.hardware.stm32_driver --port /dev/ttyUSB0 --baud 115200 --ping
+
+# Measure UART round-trip latency (200 iterations)
+python -m sentinel_x.hardware.stm32_driver --port /dev/ttyUSB0 --timing-runs 200
+
+# Simulation mode (no hardware needed – uses SimulatedDriver)
+python -m sentinel_x.hardware.stm32_driver --ping
 ```
 
 ---
@@ -147,8 +165,15 @@ python scripts/replay_tflite.py \
 
 ## Step 5 – Run the hardware integration loop
 
+Both import paths are supported:
+
 ```python
+# Package form (preferred)
+from sentinel_x.hardware import create_hardware_interface, SpacecraftSensorInterface
+
+# Legacy / direct form (also works)
 from hardware import create_hardware_interface, SpacecraftSensorInterface
+
 from sentinel_x import export_tflite_int8
 
 # Choose your target: "rpi", "stm32", or "simulation"
@@ -222,6 +247,39 @@ GPIO.output(17, GPIO.LOW)
 
 ---
 
+## Step 7 – Run the full hardware validation pipeline
+
+`scripts/collect_hardware_perf.py` automates timing, RL evaluation, and
+report generation in one command:
+
+```bash
+# With a real MCU via UART
+python scripts/collect_hardware_perf.py \
+    --port /dev/ttyUSB0 \
+    --timing-runs 1000 \
+    --train-episodes 50 \
+    --output results.json
+
+# Simulation mode (no hardware needed – suitable for CI)
+python scripts/collect_hardware_perf.py --quiet --max-steps 10 --train-episodes 2
+```
+
+Outputs:
+- `hardware_perf_results.json` – full raw metrics (use for paper tables)
+- `hardware_perf_report.md` – human-readable summary with PASS/FAIL per budget
+
+## Step 8 – Monitor the swarm in real time
+
+```bash
+# Simulation (no hardware)
+python scripts/dashboard.py
+
+# Live telemetry from a connected MCU
+python scripts/dashboard.py --port /dev/ttyUSB0 --baud 115200
+```
+
+---
+
 ## Troubleshooting
 
 **`FileNotFoundError: /dev/serial0`**
@@ -238,3 +296,7 @@ result explicitly: `STM32Driver(port="/dev/ttyUSB0")`.
 **Inference gives wrong actions after flashing**
 → Ensure the model flatbuffer was generated from the same trained agent used
 for Python-side evaluation.  Re-run `export_tflite_int8()` and `xxd -i`.
+
+**`Permission denied on /dev/ttyUSB0`**
+→ Add your user to the `dialout` group:
+  `sudo usermod -a -G dialout $USER`  (log out and back in to take effect).

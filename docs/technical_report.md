@@ -311,9 +311,13 @@ provided attribution is maintained.
 
 ```
 sentinel_x/          # importable Python package
+  hardware/          # sentinel_x.hardware subpackage (re-exports HAL)
 hardware/            # HAL, RPi driver, STM32 driver, FreeRTOS task
 scripts/             # collect_hardware_perf, dashboard, timing validator, …
-docs/                # 9 technical guides + this report
+docs/                # 10 technical guides + this report
+  hardware_deployment.md     # step-by-step RPi + STM32 guide
+  hardware_integration.md    # wiring, protocol, and embedded deployment
+  hardware_performance_results.md  # reference timing tables
 tests/               # 285+ pytest tests (all passing)
 ```
 
