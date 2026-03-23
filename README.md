@@ -1029,6 +1029,7 @@ SENTINEL-X/
 ├── requirements.txt
 ├── LICENSE                               # Apache License 2.0
 ├── CONTRIBUTING.md                       # Development guide + PR checklist
+├── ROADMAP.md                            # 10-item enhancement roadmap
 ├── CITATION.cff                          # Machine-readable citation metadata
 └── .github/
     └── workflows/
@@ -1084,6 +1085,20 @@ Additional technical documentation lives in the `docs/` folder:
 * [**docs/technical_report.md**](docs/technical_report.md) —
   Full technical report: architecture, experimental results, verification
   approach, open-source distribution, future work, and bibliography.
+
+* [**docs/benchmarking.md**](docs/benchmarking.md) —
+  How to benchmark SENTINEL-X against rule-based FDIR, isolated single-agent
+  DQN, Ray RLLib, and commercial RTOS safety solutions.
+
+* [**docs/continuous_learning.md**](docs/continuous_learning.md) —
+  Long-term autonomy: online policy fine-tuning, mission planning integration,
+  and human-in-the-loop decision support with operator feedback.
+
+* [**ROADMAP.md**](ROADMAP.md) —
+  10-item enhancement roadmap: publication venues, CubeSat deployment,
+  advanced RL algorithms, extended formal verification, HIL improvements,
+  community collaboration, new mission domains, educational material,
+  benchmarking, and continuous learning.
 
 ---
 
@@ -1149,6 +1164,9 @@ A machine-readable citation is also available in [`CITATION.cff`](CITATION.cff)
 Contributions are warmly welcome!  Please read
 [`CONTRIBUTING.md`](CONTRIBUTING.md) for the development workflow, code
 style guide, and pull-request checklist.
+
+See [`ROADMAP.md`](ROADMAP.md) for the list of open enhancement areas and
+the best places to start contributing.
 
 ---
 

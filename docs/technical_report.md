@@ -314,10 +314,14 @@ sentinel_x/          # importable Python package
   hardware/          # sentinel_x.hardware subpackage (re-exports HAL)
 hardware/            # HAL, RPi driver, STM32 driver, FreeRTOS task
 scripts/             # collect_hardware_perf, dashboard, timing validator, …
-docs/                # 10 technical guides + this report
-  hardware_deployment.md     # step-by-step RPi + STM32 guide
-  hardware_integration.md    # wiring, protocol, and embedded deployment
+notebooks/           # getting_started.ipynb tutorial
+docs/                # 12 technical guides + this report
+  hardware_deployment.md       # step-by-step RPi + STM32 guide
+  hardware_integration.md      # wiring, protocol, and embedded deployment
   hardware_performance_results.md  # reference timing tables
+  benchmarking.md              # comparison against rule-based and RLLib
+  continuous_learning.md       # long-term autonomy and human-in-the-loop
+ROADMAP.md           # 10-item enhancement roadmap with implementation guides
 tests/               # 285+ pytest tests (all passing)
 ```
 
@@ -325,6 +329,15 @@ tests/               # 285+ pytest tests (all passing)
 
 Contributions are welcome via pull requests.  See `CONTRIBUTING.md` for the
 development workflow, code style guide, and test requirements.
+
+The long-term roadmap — covering multi-agent RL, extended formal verification,
+hardware-in-the-loop improvements, new mission domains, and educational
+material — is maintained in [`ROADMAP.md`](../ROADMAP.md).
+
+**Suggested publication venues for work built on SENTINEL-X:**
+IEEE Aerospace Conference, AIAA SciTech (Space Systems track),
+*Acta Astronautica*, NeurIPS/ICML (RL safety), and SAFECOMP (safety-critical
+ML certification).
 
 ### 5.3  Citation
 
@@ -346,6 +359,9 @@ If you use SENTINEL-X in academic work, please cite:
 
 ## 6  Future Work
 
+A full roadmap with implementation guidance is maintained in
+[`ROADMAP.md`](../ROADMAP.md).  The primary directions are summarised below.
+
 1. **Extended hardware campaign** – systematic data collection on additional
    boards (ESP32, RISC-V, FPGA SoC) with radiation-induced fault injection
    (via SEU emulation).
@@ -354,16 +370,35 @@ If you use SENTINEL-X in academic work, please cite:
    with an onboard Cortex-M7 aggregation node to enable fully autonomous
    multi-spacecraft coordination without ground contact.
 
-3. **Adversarial robustness hardening** – use ERAN-certified training
-   (certified adversarial training) to improve the L∞ robustness bound beyond
-   the current ε = 0.1 level.
+3. **Model-based and multi-agent RL** – complement DQN/PPO with a world-model
+   planner (Dreamer / MBPO) and cooperative recovery via QMIX or MAPPO,
+   targeting a 10–50 × reduction in required training interactions.
 
-4. **Flight qualification** – complete DO-333 / ECSS-E-ST-40C qualification
+4. **Extended formal verification** – prove safety properties over the
+   full continuous state space using Marabou / ERAN, and integrate a
+   verification gate into CI (fail PR on LTL regression).
+
+5. **Adversarial robustness hardening** – use ERAN-certified training
+   to improve the L∞ robustness bound beyond the current ε = 0.1 level.
+
+6. **Flight qualification** – complete DO-333 / ECSS-E-ST-40C qualification
    for a CubeSat technology demonstration mission.
 
-5. **Large-scale constellation** – evaluate gossip-based federated learning
+7. **Large-scale constellation** – evaluate gossip-based federated learning
    at 50–100 spacecraft scale, comparing convergence speed and communication
    overhead versus centralised FedAvg.
+
+8. **New mission domains** – adapt fault models for planetary rovers, UAVs,
+   and underwater vehicles; register as custom scenarios via
+   `run_experiment.py --scenario`.
+
+9. **Educational material** – interactive Jupyter notebook and a web-based
+   simulator enabling students to experiment with fault scenarios without a
+   local installation.
+
+10. **Continuous / online learning** – periodic on-board policy fine-tuning
+    using prioritised experience replay, with human-in-the-loop operator
+    override and feedback integration.
 
 ---
 
